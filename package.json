@@ -41,10 +41,10 @@
   },
   "sideEffects": false,
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   },
   "scripts": {
-    "compile": "tsup src/index.ts --format cjs,esm --dts --clean --target node24 --external next-auth",
+    "compile": "tsup src/index.ts --format cjs,esm --dts --clean --target node22 --external next-auth",
     "typecheck": "tsc",
     "test": "node --test \"test/**/*.test.ts\"",
     "test:package": "node scripts/test-package.ts",

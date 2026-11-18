@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Breaking
 
-- Requires Node.js 24 or later.
+- Requires Node.js 22 or later.
 - Requires `next-auth` 4.24.15 or later. Older versions have known security issues.
 - The provider no longer puts the tokens on the NextAuth `User`. Read them from `account` in the
   `jwt` callback with `toSubriteJWT` (as the README shows). This stops stale copies of the tokens

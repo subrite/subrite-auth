@@ -98,7 +98,7 @@ export default function LogoutPage() {
 
 If your application uses [NextAuth.js](https://next-auth.js.org/) v4, you can use the `@subrite/next-auth-provider` NPM module.
 
-It requires Node.js 24 or later and `next-auth` 4.24.15 or later.
+It requires Node.js 22 or later and `next-auth` 4.24.15 or later.
 
 ### Installation
 

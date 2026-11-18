@@ -251,11 +251,18 @@ describe('refreshAccessToken', () => {
         }),
     });
     const token = sessionToken();
-    const started = Date.now();
-    const refreshed = await refreshAccessToken(token, { ...subrite.params, timeoutMs: 50 });
-    assert.deepEqual(refreshed, token);
-    assert.ok(Date.now() - started < 5000);
-    assert.match(loggedText(), /TimeoutError/);
+    // The timer behind AbortSignal.timeout doesn't keep Node running. A real request does, through
+    // its open socket. The fake request has no socket, so keep Node running for it.
+    const keepAlive = setTimeout(() => {}, 5000);
+    try {
+      const started = Date.now();
+      const refreshed = await refreshAccessToken(token, { ...subrite.params, timeoutMs: 50 });
+      assert.deepEqual(refreshed, token);
+      assert.ok(Date.now() - started < 5000);
+      assert.match(loggedText(), /TimeoutError/);
+    } finally {
+      clearTimeout(keepAlive);
+    }
   });
 
   it('never throws, even with a broken timeout', async () => {

@@ -2,7 +2,8 @@
 
 ## Development
 
-You need Node.js 24. With [nvm](https://github.com/nvm-sh/nvm), run `nvm use` in the repository.
+Development uses Node.js 24. With [nvm](https://github.com/nvm-sh/nvm), run `nvm use` in the repository.
+The package supports Node.js 22 and later, and CI runs every check on both 22 and 24.
 
     npm ci
     npm test
