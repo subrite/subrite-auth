@@ -439,6 +439,211 @@ describe('outages', () => {
   });
 });
 
+describe('outages caused by one account or one moment', () => {
+  it('a refresh token that keeps failing does not hold up other users', async () => {
+    const tick = fakeClock();
+    const broken = sessionToken();
+    const subrite = fakeSubrite({
+      token: ({ form }) =>
+        form.get('refresh_token') === broken.refreshToken
+          ? new Response('server error', { status: 500 })
+          : rotatingTokens(),
+    });
+    // The first failure could be an outage, so the client pauses once.
+    await refreshAccessToken(broken, subrite.params);
+    tick(10_000);
+    // The same token fails again: only that token waits longer. Everyone else carries on.
+    await refreshAccessToken(broken, subrite.params);
+    for (let i = 0; i < 5; i += 1) {
+      assert.match(
+        (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+        /^access-/,
+      );
+    }
+    // The broken token itself now waits 20 s.
+    tick(19_999);
+    await refreshAccessToken(broken, subrite.params);
+    const brokenAttempts = () =>
+      subrite.calls.token.filter((r) => r.form.get('refresh_token') === broken.refreshToken).length;
+    assert.equal(brokenAttempts(), 2);
+    tick(1);
+    await refreshAccessToken(broken, subrite.params);
+    assert.equal(brokenAttempts(), 3);
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+  });
+
+  it('counts requests that failed together as one failure, so the pause stays at 10 s', async () => {
+    const tick = fakeClock();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let isDown = true;
+    const subrite = fakeSubrite({
+      token: async () => {
+        if (!isDown) return rotatingTokens();
+        await gate;
+        return new Response('bad gateway', { status: 502 });
+      },
+    });
+    const inFlight = [1, 2, 3, 4, 5, 6].map(() =>
+      refreshAccessToken(sessionToken(), subrite.params),
+    );
+    release();
+    await Promise.all(inFlight);
+    tick(10_000);
+    isDown = false;
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+  });
+
+  it('keeps others waiting until the probe answers, even if a failing token answers first', async () => {
+    const tick = fakeClock();
+    const broken = sessionToken();
+    let releaseBroken: () => void = () => {};
+    let brokenGate: Promise<void> = Promise.resolve();
+    let releaseProbe: () => void = () => {};
+    let probeGate: Promise<void> | undefined = undefined;
+    let isDown = false;
+    const subrite = fakeSubrite({
+      token: async ({ form }) => {
+        if (form.get('refresh_token') === broken.refreshToken) {
+          await brokenGate;
+          return new Response('server error', { status: 500 });
+        }
+        if (probeGate) {
+          await probeGate;
+          return rotatingTokens();
+        }
+        return isDown ? down() : rotatingTokens();
+      },
+    });
+    // The broken token fails once, then Subrite answers others again.
+    await refreshAccessToken(broken, subrite.params);
+    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    // The broken token tries again (slowly) while the client is healthy.
+    brokenGate = new Promise<void>((resolve) => (releaseBroken = resolve));
+    const brokenAgain = refreshAccessToken(broken, subrite.params);
+    // Now an outage begins, and after the pause a probe starts.
+    isDown = true;
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(10_000);
+    probeGate = new Promise<void>((resolve) => (releaseProbe = resolve));
+    const probe = refreshAccessToken(sessionToken(), subrite.params);
+    // The broken token's answer arrives first. It must not let everyone through.
+    releaseBroken();
+    await brokenAgain;
+    const callsBefore = subrite.calls.token.length;
+    const waiting = sessionToken();
+    assert.deepEqual(await refreshAccessToken(waiting, subrite.params), waiting);
+    assert.equal(subrite.calls.token.length, callsBefore, 'still waiting for the probe');
+    releaseProbe();
+    assert.match((await probe).accessToken, /^access-/);
+  });
+
+  it('forgets an outage that ended long ago', async () => {
+    const tick = fakeClock();
+    let isDown = true;
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const subrite = fakeSubrite({
+      token: async () => {
+        await gate;
+        return isDown ? down() : rotatingTokens();
+      },
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    isDown = false;
+    tick(3 * 60 * MINUTE);
+    // Two users refresh at the same time. Neither has to wait for the other.
+    gate = new Promise<void>((resolve) => (release = resolve));
+    const both = [
+      refreshAccessToken(sessionToken(), subrite.params),
+      refreshAccessToken(sessionToken(), subrite.params),
+    ];
+    release();
+    for (const result of await Promise.all(both)) {
+      assert.match(result.accessToken, /^access-/);
+    }
+  });
+
+  it('a clock that goes backwards ends a pause instead of stretching it', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start });
+    let isDown = true;
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    isDown = false;
+    // NTP sets the clock an hour back. Without care, the pause would last another hour.
+    mock.timers.setTime(start - 60 * MINUTE);
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+  });
+});
+
+describe('reuse never hands out an expired access token', () => {
+  it('ignores an oldCookieGraceSeconds longer than the access token lifetime', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({
+      token: () => {
+        rotation += 1;
+        return ok({
+          access_token: `access-${rotation}`,
+          refresh_token: `refresh-${rotation}`,
+          expires_in: 300,
+        });
+      },
+    });
+    const params = { ...subrite.params, oldCookieGraceSeconds: 3600 };
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, params);
+    // The default window ends 60 s before the 300 s access token expires. A longer grace changes
+    // nothing.
+    tick(240_000);
+    const later = await refreshAccessToken(oldCookie, params);
+    assert.equal(subrite.calls.token.length, 2);
+    assert.ok(later.accessTokenExpires > Date.now());
+  });
+
+  it('caps the reuse of a short-lived rotated access token at its expiry', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({
+      token: () => {
+        rotation += 1;
+        return ok({
+          access_token: `access-${rotation}`,
+          refresh_token: `refresh-${rotation}`,
+          expires_in: 10,
+        });
+      },
+    });
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, subrite.params);
+    tick(10_000);
+    await refreshAccessToken(oldCookie, subrite.params);
+    assert.equal(subrite.calls.token.length, 2);
+  });
+
+  it('falls back to the default and logs once for an oldCookieGraceSeconds that is not a number', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const params = { ...subrite.params, oldCookieGraceSeconds: Number(undefined) };
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, params);
+    tick(10 * MINUTE);
+    await refreshAccessToken(oldCookie, params);
+    await refreshAccessToken(sessionToken(), params);
+    assert.equal(subrite.calls.token.length, 2, 'the old cookie was answered from memory');
+    assert.ok((loggedText().match(/oldCookieGraceSeconds must be a number/g)?.length ?? 0) <= 1);
+  });
+});
+
 describe('revokeRefreshToken', () => {
   it('revokes the refresh token at Subrite with the client credentials', async () => {
     const subrite = fakeSubrite({ token: rotatingTokens });
@@ -500,6 +705,7 @@ describe('cache size', () => {
         settled: { kind: 'temporary-failure' },
         sentRefreshToken: `filler-${i}`,
         reuseUntil: Number.POSITIVE_INFINITY,
+        keepUntil: Number.POSITIVE_INFINITY,
       });
     }
     // Another refresh makes the cache prune. The one in progress must stay.
@@ -528,6 +734,7 @@ describe('clock changes', () => {
       settled: { kind: 'temporary-failure' },
       sentRefreshToken: 'old',
       reuseUntil: start - 1,
+      keepUntil: start - 1,
     });
     await refreshAccessToken(sessionToken(), subrite.params);
     assert.equal(refreshes.has('finished-long-ago'), false);

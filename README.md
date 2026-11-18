@@ -263,8 +263,12 @@ export function SubriteSessionGuard() {
 
 On the server, check `session.error` (from `getServerSession`) or `token.error` (from `getToken`) the same way.
 
-Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
-Refreshes for that Subrite client then pause for 10 seconds, or as long as Subrite's `Retry-After` header says. After the pause one request checks whether Subrite is back, while the others keep their tokens. Each failure in a row doubles the pause, up to 5 minutes.
+Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, a response without tokens, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
+
+- That refresh token waits 10 seconds before it is tried again (or as long as Subrite's `Retry-After` header says), doubling with each failure in a row up to 5 minutes.
+- If the refresh token worked before, the failure may mean Subrite is in trouble. Then all refreshes for that Subrite client pause the same way, and after the pause one request checks whether Subrite is back while the others keep their tokens. Requests that fail at the same moment count as one failure.
+- A refresh token that keeps failing on its own (for example because of bad data for one account) only delays itself, never other users.
+
 Configuration problems are logged with a hint, and sessions recover on their own once the configuration is fixed.
 
 ### Where a refreshed token is saved
@@ -290,7 +294,7 @@ In App Router apps, make sure the browser saves the refreshed cookie soon:
 
 An app that only renders on the server, without `SessionProvider`, sends an already used refresh token once the new access token expires. If Subrite rotates refresh tokens, that user must sign in again.
 
-Answering old cookies from memory also means a copied session cookie gets new tokens without Subrite noticing the reuse. If your app always saves refreshed cookies right away (Pages Router, or no Server Components that read the session), make the window short:
+Answering old cookies from memory also means a copied session cookie gets new tokens without Subrite noticing the reuse. If your app always saves refreshed cookies right away (Pages Router, or no Server Components that read the session), make the window short. The setting can only shorten the default window, and never below 30 seconds:
 
 ```typescript
 refreshAccessToken(token, { ...subriteConfig, oldCookieGraceSeconds: 30 });

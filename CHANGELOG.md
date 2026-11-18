@@ -40,17 +40,20 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   rejected refresh token is removed and Subrite is not asked again for that session. In 0.2.1 any
   failure, even a network blip, set the error for good.
 - Every other failure leaves the token as is: network errors, timeouts, a response that breaks
-  off, redirects, 5xx, 429, firewall or CDN pages, and client configuration errors such as
-  `invalid_client`, `unauthorized_client` or `invalid_request`. Refreshes for that Subrite client
-  then pause for 10 seconds (or as long as `Retry-After` says), doubling with each failure in a
-  row up to 5 minutes, and one request at a time checks whether Subrite is back.
+  off or has no tokens, redirects, 5xx, 429, firewall or CDN pages, and client configuration
+  errors such as `invalid_client`, `unauthorized_client` or `invalid_request`. That refresh
+  token waits 10 seconds (or as long as `Retry-After` says), doubling with each failure in a row
+  up to 5 minutes. When a refresh token that worked before fails, refreshes for the whole Subrite
+  client pause the same way and one request at a time checks whether Subrite is back. Requests
+  that fail together count once, and a refresh token that keeps failing on its own never holds
+  up other users.
 - Sessions that 0.2.1 marked with `RefreshAccessTokenError` after a temporary failure recover on
   the next refresh.
 - Requests that hold the same refresh token share one refresh within a server process, also
   across the copies of the library that Next.js loads for different routers. When Subrite
   replaced the refresh token, a later request with an old cookie gets the new tokens from memory
-  until the new access token is about to expire (configurable with `oldCookieGraceSeconds`),
-  instead of sending the used refresh token again. When Subrite kept it, results are shared for
+  until the new access token is about to expire (`oldCookieGraceSeconds` can shorten this),
+  instead of sending the used refresh token again. An expired access token is never handed out. When Subrite kept it, results are shared for
   30 seconds at most. Results are never shared between different Subrite servers or clients.
 - `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, never
   follows redirects (and works on Cloudflare Workers), and authenticates the same way as the sign

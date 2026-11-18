@@ -55,7 +55,8 @@ export type RefreshParams = {
    * Defaults to the lifetime of the new access token (minus one minute). That is what App
    * Router Server Components need, because they can't save the refreshed cookie. If your app
    * always saves refreshed cookies right away, set it low (30 is the minimum): an old cookie used
-   * later is then sent to Subrite, whose reuse detection can end the stolen session.
+   * later is then sent to Subrite, whose reuse detection can end the stolen session. It can only
+   * shorten the default. Longer values have no effect.
    */
   oldCookieGraceSeconds?: number;
 };
@@ -183,19 +184,29 @@ type RefreshEntry = {
   /** Set once the request has finished. */
   settled?: RefreshOutcome;
   settledAt?: number;
+  startedAt: number;
   /** The refresh token this entry sent to Subrite. */
   sentRefreshToken: string;
   /** Until when other requests with the same refresh token get this outcome. */
   reuseUntil: number;
+  /** Until when the entry is kept. Longer than reuseUntil after a failure, to count failures. */
+  keepUntil: number;
+  /** Temporary failures in a row for this refresh token. */
+  failures: number;
+  /** This request checks whether Subrite is back after a pause. */
+  probe: boolean;
   /** Whether a late reuse of this entry has been logged. */
   warned?: boolean;
 };
 
 /** How Subrite has been answering for one Subrite URL and client id. */
 type ClientHealth = {
+  /** Outage steps in a row. Each one doubles the pause. */
   failures: number;
-  lastFailure: number;
-  /** No new refreshes for this client until then. */
+  /** When the latest step began. Requests that started before it belong to the same step. */
+  lastStep: number;
+  /** No new refreshes for this client from pausedFrom until pausedUntil. */
+  pausedFrom: number;
   pausedUntil: number;
   /** A refresh is checking whether Subrite is back. Others wait for it. */
   probing: boolean;
@@ -231,7 +242,8 @@ const state = processWide<State>('state', () => ({
  * Never throws. When Subrite rejects the refresh token (`invalid_grant`), the returned token
  * has `error: 'RefreshAccessTokenError'` and an empty `refreshToken`, and the user must sign in
  * again. Further calls with that token return it as is, without calling Subrite. Any other
- * failure leaves the token unchanged, and the refresh is tried again later.
+ * failure leaves the token unchanged, and the refresh is tried again later. A refresh token
+ * that keeps failing waits longer each time without holding up other users.
  */
 export async function refreshAccessToken(
   token: JWT & SubriteJWT,
@@ -335,28 +347,58 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
     warnOnLateReuse(existing, now);
     return existing.outcome;
   }
+  // Failures in a row for this refresh token, if its last attempt failed recently.
+  const tokenFailures =
+    existing?.settled?.kind === 'temporary-failure' && existing.keepUntil > now
+      ? existing.failures
+      : 0;
 
-  const health = state.clients.get(clientKey);
-  if (health && (health.pausedUntil > now || health.probing)) {
+  const health = clientHealth(clientKey, now);
+  if (health.pausedUntil > now || health.probing) {
     // Subrite is having trouble. Keep the token and don't add to the load.
     return Promise.resolve(TEMPORARY);
   }
-  if (health && health.failures > 0) {
-    // This request checks whether Subrite is back. Other requests wait for its answer.
+  // After a pause, this request checks whether Subrite is back. Other requests wait for it.
+  const probe = health.failures > 0;
+  if (probe) {
     health.probing = true;
   }
 
   const entry: RefreshEntry = {
     outcome: requestRefresh(refreshToken, params),
+    startedAt: now,
     sentRefreshToken: refreshToken,
-    // Keep the entry while the request is in progress. Set the real deadline once it finishes.
+    // Keep the entry while the request is in progress. Set the real deadlines once it finishes.
     reuseUntil: Number.POSITIVE_INFINITY,
+    keepUntil: Number.POSITIVE_INFINITY,
+    failures: tokenFailures,
+    probe,
   };
   // Delete first, so the Map's insertion order stays oldest first for pruning.
   state.refreshes.delete(key);
   state.refreshes.set(key, entry);
   entry.outcome.then((outcome) => settle(entry, clientKey, outcome, params));
   return entry.outcome;
+}
+
+function clientHealth(clientKey: string, now: number): ClientHealth {
+  let health = state.clients.get(clientKey);
+  if (!health) {
+    health = { failures: 0, lastStep: 0, pausedFrom: 0, pausedUntil: 0, probing: false };
+    state.clients.set(clientKey, health);
+  }
+  // A clock that went backwards (for example an NTP correction) would stretch a pause by the
+  // size of the step. End the pause instead: only one probe goes through anyway.
+  if (now < health.pausedFrom) {
+    health.pausedUntil = now;
+  }
+  health.lastStep = Math.min(health.lastStep, now);
+  // An outage that ended long ago doesn't count any more.
+  if (health.failures > 0 && !health.probing && now - health.lastStep > FAILURE_MEMORY_MS) {
+    health.failures = 0;
+    health.pausedUntil = 0;
+  }
+  return health;
 }
 
 function settle(
@@ -372,59 +414,88 @@ function settle(
     entry.settled = outcome;
     entry.settledAt = now;
   }
-  const health = state.clients.get(clientKey) ?? {
-    failures: 0,
-    lastFailure: 0,
-    pausedUntil: 0,
-    probing: false,
-  };
-  state.clients.set(clientKey, health);
-  health.probing = false;
-  if (revoked && outcome.kind !== 'temporary-failure') {
+  const health = clientHealth(clientKey, now);
+  if (entry.probe) {
+    health.probing = false;
+  }
+
+  if (outcome.kind !== 'temporary-failure') {
+    // Subrite answered, so it is up.
     health.failures = 0;
     health.pausedUntil = 0;
+    if (revoked) return;
+    entry.failures = 0;
+    entry.reuseUntil =
+      outcome.kind === 'success'
+        ? successReuseUntil(entry, outcome, params, now)
+        : now + PERMANENT_FAILURE_REUSE_MS;
+    entry.keepUntil = entry.reuseUntil;
     return;
   }
 
-  switch (outcome.kind) {
-    case 'success': {
-      health.failures = 0;
-      health.pausedUntil = 0;
-      if (outcome.refreshToken === entry.sentRefreshToken) {
-        // Subrite kept the refresh token, so sending it again is fine. Only share the result
-        // with requests that arrive together, and never past the access token's expiry.
-        entry.reuseUntil = Math.min(now + MIN_SUCCESS_REUSE_MS, outcome.accessTokenExpires);
-      } else if (params.oldCookieGraceSeconds !== undefined) {
-        // At least long enough for requests that arrive together to share the refresh.
-        const grace = Math.max(params.oldCookieGraceSeconds * 1000, MIN_SUCCESS_REUSE_MS);
-        entry.reuseUntil = now + grace;
-      } else {
-        // Subrite replaced the refresh token. Sending the old one again would be a reuse, which
-        // Subrite may answer by revoking the whole sign in. Answer old cookies from memory.
-        const nearExpiry = outcome.accessTokenExpires - DEFAULT_EXPIRY_MARGIN_SECONDS * 1000;
-        entry.reuseUntil = Math.max(now + MIN_SUCCESS_REUSE_MS, nearExpiry);
-      }
-      return;
-    }
-    case 'permanent-failure':
-      // Subrite answered, so it is up.
-      health.failures = 0;
-      health.pausedUntil = 0;
-      entry.reuseUntil = now + PERMANENT_FAILURE_REUSE_MS;
-      return;
-    case 'temporary-failure': {
-      if (now - health.lastFailure > FAILURE_MEMORY_MS) {
-        health.failures = 0;
-      }
-      health.failures += 1;
-      health.lastFailure = now;
-      const backoff = outcome.retryAfterMs ?? BACKOFF_MS * 2 ** Math.min(health.failures - 1, 10);
-      health.pausedUntil = now + Math.min(Math.max(backoff, BACKOFF_MS), MAX_BACKOFF_MS);
-      // Nothing worth reusing. The pause decides when to try again.
-      if (!revoked) entry.reuseUntil = now;
-      return;
+  const firstFailureOfToken = entry.failures === 0;
+  if (!revoked) {
+    // This refresh token waits on its own, longer after each failure in a row.
+    entry.failures += 1;
+    entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
+    entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
+  }
+  // A refresh token that keeps failing may be the problem itself (bad data for one account),
+  // so it never pauses other users. A token that failed for the first time says Subrite may be
+  // in trouble: pause the client.
+  if (!firstFailureOfToken) {
+    return;
+  }
+  // Requests already on their way when an outage began are part of the same step, so one blip
+  // with many requests in flight counts once.
+  if (health.failures === 0 || entry.startedAt > health.lastStep) {
+    health.failures += 1;
+    health.lastStep = now;
+  }
+  health.pausedUntil = Math.max(
+    health.pausedUntil,
+    now + pauseLength(health.failures, outcome.retryAfterMs),
+  );
+  health.pausedFrom = now;
+}
+
+// 10 s doubling to 5 min, or what Subrite asked for with Retry-After, within the same bounds.
+function pauseLength(failures: number, retryAfterMs: number | undefined): number {
+  const wanted = retryAfterMs ?? BACKOFF_MS * 2 ** Math.min(failures - 1, 10);
+  return Math.min(Math.max(wanted, BACKOFF_MS), MAX_BACKOFF_MS);
+}
+
+let warnedAboutGrace = false;
+
+function successReuseUntil(
+  entry: RefreshEntry,
+  outcome: Extract<RefreshOutcome, { kind: 'success' }>,
+  params: RefreshParams,
+  now: number,
+): number {
+  const expires = outcome.accessTokenExpires;
+  if (outcome.refreshToken === entry.sentRefreshToken) {
+    // Subrite kept the refresh token, so sending it again is fine. Only share the result with
+    // requests that arrive together.
+    return Math.min(now + MIN_SUCCESS_REUSE_MS, expires);
+  }
+  // Subrite replaced the refresh token. Sending the old one again would be a reuse, which
+  // Subrite may answer by revoking the whole sign in. Answer old cookies from memory.
+  let until = Math.max(now + MIN_SUCCESS_REUSE_MS, expires - DEFAULT_EXPIRY_MARGIN_SECONDS * 1000);
+  const grace = params.oldCookieGraceSeconds;
+  if (grace !== undefined) {
+    if (Number.isFinite(grace)) {
+      // The setting can only shorten the window, and never below 30 s.
+      until = Math.min(until, now + Math.max(grace * 1000, MIN_SUCCESS_REUSE_MS));
+    } else if (!warnedAboutGrace) {
+      warnedAboutGrace = true;
+      console.error(
+        'Subrite: oldCookieGraceSeconds must be a number of seconds. Using the default.',
+      );
     }
   }
+  // Never hand out an access token that has already expired.
+  return Math.min(until, expires);
 }
 
 // An old cookie answered from memory long after its refresh is normal for App Router Server
@@ -466,8 +537,12 @@ function forgetRefreshToken(refreshToken: string, params: RefreshParams): void {
     outcome: Promise.resolve(PERMANENT),
     settled: PERMANENT,
     settledAt: now,
+    startedAt: now,
     sentRefreshToken,
     reuseUntil: now + PERMANENT_FAILURE_REUSE_MS,
+    keepUntil: now + PERMANENT_FAILURE_REUSE_MS,
+    failures: 0,
+    probe: false,
   });
   for (const [key, entry] of state.refreshes) {
     if (!key.startsWith(prefix)) continue;
@@ -484,6 +559,7 @@ function forgetRefreshToken(refreshToken: string, params: RefreshParams): void {
     current.settled = PERMANENT;
     current.settledAt = now;
     current.reuseUntil = now + PERMANENT_FAILURE_REUSE_MS;
+    current.keepUntil = current.reuseUntil;
   } else {
     state.refreshes.delete(key);
     state.refreshes.set(key, revoked(refreshToken));
@@ -496,7 +572,7 @@ function pruneRefreshes(now: number): void {
   if (now < state.lastPrune || now - state.lastPrune >= PRUNE_INTERVAL_MS) {
     state.lastPrune = now;
     for (const [key, entry] of refreshes) {
-      if (entry.settled && entry.reuseUntil <= now) {
+      if (entry.settled && entry.keepUntil <= now) {
         refreshes.delete(key);
       }
     }
@@ -598,11 +674,12 @@ async function callTokenEndpoint(
 
   const accessToken = readString(body, 'access_token');
   if (!accessToken) {
-    // The body may hold tokens, so only log which field is missing.
+    // Not a real token response, for example a maintenance page answering 200. Only
+    // invalid_grant signs users out. The body may hold tokens, so only log the status.
     console.error('Error refreshing access token: the token response has no access_token', {
       status: response.status,
     });
-    return PERMANENT;
+    return TEMPORARY;
   }
   let expiresIn = readExpiresIn(body);
   if (expiresIn === undefined) {

@@ -221,13 +221,13 @@ describe('refreshAccessToken', () => {
     assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
   });
 
-  it('flags a token response without an access token, and logs no tokens', async () => {
+  it('keeps the session when a 200 has no access token, and logs no tokens', async () => {
+    // For example a maintenance page answering 200. Only invalid_grant signs users out.
     const subrite = fakeSubrite({
       token: () => ok({ refresh_token: 'secret-refresh', expires_in: 60 }),
     });
     const token = sessionToken();
-    const refreshed = await refreshAccessToken(token, subrite.params);
-    assert.equal(refreshed.error, 'RefreshAccessTokenError');
+    assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
     assert.doesNotMatch(loggedText(), /secret-refresh/);
     assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
   });
