@@ -266,7 +266,7 @@ On the server, check `session.error` (from `getServerSession`) or `token.error` 
 Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, a response without tokens, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
 
 - That refresh token waits 10 seconds before it is tried again (or as long as Subrite's `Retry-After` header says), doubling with each failure in a row up to 5 minutes. A refresh token that keeps failing on its own (for example because of bad data for one account) only delays itself.
-- When two different refresh tokens fail with no answer from Subrite in between, Subrite is likely in trouble. Then all refreshes for that Subrite client pause the same way, and one request at a time checks whether Subrite is back while the others keep their tokens. Requests that fail at the same moment count once, and the pause only grows when a refresh token that had not failed yet fails too.
+- When two different refresh tokens fail with no answer from Subrite in between, Subrite is likely in trouble. Then all refreshes for that Subrite client pause the same way, and one request at a time checks whether Subrite is back while the others keep their tokens. Requests that fail at the same moment count once, and the pause only grows when a refresh token that had not failed yet fails too. A check by a refresh token that already failed in the outage only holds back tokens like it, so a few broken accounts can't keep healthy users out.
 - As soon as Subrite answers again, everyone refreshes right away.
 
 Configuration problems are logged with a hint, and sessions recover on their own once the configuration is fixed.
