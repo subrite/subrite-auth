@@ -82,12 +82,12 @@ const DEFAULT_EXPIRY_MARGIN_SECONDS = 60;
 const MIN_SUCCESS_REUSE_MS = 30_000;
 // A rejected refresh token is answered from memory for this long, without asking Subrite again.
 const PERMANENT_FAILURE_REUSE_MS = 60 * 60 * 1000;
-// After a failure that isn't about the token (network, timeout, 5xx, 429, configuration),
-// refreshes for that Subrite client pause, then one request tries again. The pause doubles with
-// every failure in a row, up to the maximum, unless Subrite says how long with Retry-After.
+// After a temporary failure, the refresh token waits before it is tried again: 10 s, doubling
+// with every failure in a row up to the maximum, unless Subrite says how long with Retry-After.
+// When Subrite seems down for the whole client, all its refreshes pause the same way.
 const BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
-// Failures further apart than this don't count as in a row.
+// Failures further apart than this don't count as in a row, and don't add up to an outage.
 const FAILURE_MEMORY_MS = 15 * 60 * 1000;
 // Used when Subrite leaves out expires_in. Short, so a real expiry is missed by little.
 const FALLBACK_EXPIRES_IN_SECONDS = 300;
@@ -193,19 +193,30 @@ type RefreshEntry = {
   keepUntil: number;
   /** Temporary failures in a row for this refresh token. */
   failures: number;
-  /** This request checks whether Subrite is back after a pause. */
+  /** This request checks whether Subrite is back during an outage. */
   probe: boolean;
+  /** The probe's refresh token had not failed in this outage yet, so its failure is news. */
+  freshProbe: boolean;
+  /** Failed while Subrite seemed down. Forgiven as soon as Subrite answers again. */
+  duringOutage: boolean;
   /** Whether a late reuse of this entry has been logged. */
   warned?: boolean;
 };
 
 /** How Subrite has been answering for one Subrite URL and client id. */
 type ClientHealth = {
-  /** Outage steps in a row. Each one doubles the pause. */
-  failures: number;
-  /** When the latest step began. Requests that started before it belong to the same step. */
-  lastStep: number;
-  /** No new refreshes for this client from pausedFrom until pausedUntil. */
+  /** When Subrite last really answered a refresh (new tokens or a rejection). */
+  lastAnswer: number;
+  /**
+   * Refresh tokens that failed since then, while no outage was declared. One failing refresh
+   * token may be that token's own problem. Two different ones mean Subrite is likely down.
+   */
+  failing: Set<string>;
+  failingSince: number;
+  outage: boolean;
+  /** Steps of the outage. Each step doubles the pause. */
+  step: number;
+  /** During an outage, no new refreshes from pausedFrom until pausedUntil. */
   pausedFrom: number;
   pausedUntil: number;
   /** A refresh is checking whether Subrite is back. Others wait for it. */
@@ -342,26 +353,32 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
   pruneRefreshes(now);
   const clientKey = clientKeyOf(params);
   const key = refreshKeyOf(params, refreshToken);
+  const health = clientHealth(clientKey, now);
   const existing = state.refreshes.get(key);
-  if (existing && existing.reuseUntil > now) {
+  // A failure during an outage is not the token's fault. Once Subrite answers again, try now.
+  const forgiven = existing !== undefined && isForgiven(existing, health);
+  if (existing && existing.reuseUntil > now && !forgiven) {
     warnOnLateReuse(existing, now);
     return existing.outcome;
   }
-  // Failures in a row for this refresh token, if its last attempt failed recently.
-  const tokenFailures =
-    existing?.settled?.kind === 'temporary-failure' && existing.keepUntil > now
-      ? existing.failures
-      : 0;
+  // Failures in a row for this refresh token, if its last attempt failed recently. A forgiven
+  // token counts as having failed once, so if it fails again right away (it may be broken), it
+  // doesn't count towards a new outage.
+  const failedRecently =
+    existing?.settled?.kind === 'temporary-failure' && existing.keepUntil > now;
+  const tokenFailures = forgiven ? 1 : failedRecently ? existing.failures : 0;
 
-  const health = clientHealth(clientKey, now);
-  if (health.pausedUntil > now || health.probing) {
-    // Subrite is having trouble. Keep the token and don't add to the load.
-    return Promise.resolve(TEMPORARY);
-  }
-  // After a pause, this request checks whether Subrite is back. Other requests wait for it.
-  const probe = health.failures > 0;
-  if (probe) {
+  let probe = false;
+  let freshProbe = false;
+  if (health.outage) {
+    if (health.pausedUntil > now || health.probing) {
+      // Subrite seems down. Keep the token and don't add to the load.
+      return Promise.resolve(TEMPORARY);
+    }
+    // This request checks whether Subrite is back. Other requests wait for its answer.
+    probe = true;
     health.probing = true;
+    freshProbe = !(existing?.settled?.kind === 'temporary-failure' && existing.duringOutage);
   }
 
   const entry: RefreshEntry = {
@@ -373,18 +390,37 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
     keepUntil: Number.POSITIVE_INFINITY,
     failures: tokenFailures,
     probe,
+    freshProbe,
+    duringOutage: false,
   };
   // Delete first, so the Map's insertion order stays oldest first for pruning.
   state.refreshes.delete(key);
   state.refreshes.set(key, entry);
-  entry.outcome.then((outcome) => settle(entry, clientKey, outcome, params));
+  entry.outcome.then((outcome) => settle(entry, key, clientKey, outcome, params));
   return entry.outcome;
+}
+
+function isForgiven(entry: RefreshEntry, health: ClientHealth): boolean {
+  return (
+    entry.settled?.kind === 'temporary-failure' &&
+    entry.duringOutage &&
+    (entry.settledAt ?? 0) < health.lastAnswer
+  );
 }
 
 function clientHealth(clientKey: string, now: number): ClientHealth {
   let health = state.clients.get(clientKey);
   if (!health) {
-    health = { failures: 0, lastStep: 0, pausedFrom: 0, pausedUntil: 0, probing: false };
+    health = {
+      lastAnswer: 0,
+      failing: new Set(),
+      failingSince: 0,
+      outage: false,
+      step: 0,
+      pausedFrom: 0,
+      pausedUntil: 0,
+      probing: false,
+    };
     state.clients.set(clientKey, health);
   }
   // A clock that went backwards (for example an NTP correction) would stretch a pause by the
@@ -392,17 +428,16 @@ function clientHealth(clientKey: string, now: number): ClientHealth {
   if (now < health.pausedFrom) {
     health.pausedUntil = now;
   }
-  health.lastStep = Math.min(health.lastStep, now);
-  // An outage that ended long ago doesn't count any more.
-  if (health.failures > 0 && !health.probing && now - health.lastStep > FAILURE_MEMORY_MS) {
-    health.failures = 0;
-    health.pausedUntil = 0;
+  // Failures far apart don't add up to an outage.
+  if (health.failing.size > 0 && Math.abs(now - health.failingSince) > FAILURE_MEMORY_MS) {
+    health.failing.clear();
   }
   return health;
 }
 
 function settle(
   entry: RefreshEntry,
+  key: string,
   clientKey: string,
   outcome: RefreshOutcome,
   params: RefreshParams,
@@ -420,8 +455,11 @@ function settle(
   }
 
   if (outcome.kind !== 'temporary-failure') {
-    // Subrite answered, so it is up.
-    health.failures = 0;
+    // Subrite answered, so it is up. Any outage is over.
+    health.lastAnswer = now;
+    health.failing.clear();
+    health.outage = false;
+    health.step = 0;
     health.pausedUntil = 0;
     if (revoked) return;
     entry.failures = 0;
@@ -433,35 +471,64 @@ function settle(
     return;
   }
 
-  const firstFailureOfToken = entry.failures === 0;
+  const failedBefore = entry.failures > 0;
   if (!revoked) {
-    // This refresh token waits on its own, longer after each failure in a row.
+    // This refresh token waits on its own, longer after each failure in a row. A refresh token
+    // that keeps failing (for example bad data for one account) only delays itself.
     entry.failures += 1;
     entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
     entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
   }
-  // A refresh token that keeps failing may be the problem itself (bad data for one account),
-  // so it never pauses other users. A token that failed for the first time says Subrite may be
-  // in trouble: pause the client.
-  if (!firstFailureOfToken) {
+
+  if (!health.outage) {
+    // A refresh token that failed before may be the problem itself. Only first failures of
+    // different refresh tokens add up to an outage.
+    if (failedBefore) {
+      return;
+    }
+    if (health.failing.size === 0) {
+      health.failingSince = now;
+    }
+    health.failing.add(key);
+    if (health.failing.size < 2) {
+      return;
+    }
+    // Two different refresh tokens failed with no answer from Subrite in between: Subrite is
+    // likely down for this client. Pause all refreshes and probe one at a time.
+    health.outage = true;
+    health.step = 1;
+    pause(health, now, pauseLength(1, outcome.retryAfterMs));
+    for (const failingKey of health.failing) {
+      const failed = state.refreshes.get(failingKey);
+      if (failed) failed.duringOutage = true;
+    }
+    health.failing.clear();
     return;
   }
-  // Requests already on their way when an outage began are part of the same step, so one blip
-  // with many requests in flight counts once.
-  if (health.failures === 0 || entry.startedAt > health.lastStep) {
-    health.failures += 1;
-    health.lastStep = now;
+
+  entry.duringOutage = true;
+  if (entry.probe) {
+    // Subrite is still down. Only a refresh token that had not failed in this outage yet is new
+    // evidence, so only then wait longer. Otherwise start the same pause again.
+    if (entry.freshProbe) {
+      health.step += 1;
+    }
+    pause(health, now, pauseLength(health.step, outcome.retryAfterMs));
+  } else {
+    // A request that was already on its way: part of the same step.
+    const length = pauseLength(health.step, outcome.retryAfterMs);
+    pause(health, now, Math.max(health.pausedUntil - now, length));
   }
-  health.pausedUntil = Math.max(
-    health.pausedUntil,
-    now + pauseLength(health.failures, outcome.retryAfterMs),
-  );
+}
+
+function pause(health: ClientHealth, now: number, length: number): void {
   health.pausedFrom = now;
+  health.pausedUntil = now + length;
 }
 
 // 10 s doubling to 5 min, or what Subrite asked for with Retry-After, within the same bounds.
-function pauseLength(failures: number, retryAfterMs: number | undefined): number {
-  const wanted = retryAfterMs ?? BACKOFF_MS * 2 ** Math.min(failures - 1, 10);
+function pauseLength(step: number, retryAfterMs: number | undefined): number {
+  const wanted = retryAfterMs ?? BACKOFF_MS * 2 ** Math.min(Math.max(step, 1) - 1, 10);
   return Math.min(Math.max(wanted, BACKOFF_MS), MAX_BACKOFF_MS);
 }
 
@@ -543,6 +610,8 @@ function forgetRefreshToken(refreshToken: string, params: RefreshParams): void {
     keepUntil: now + PERMANENT_FAILURE_REUSE_MS,
     failures: 0,
     probe: false,
+    freshProbe: false,
+    duringOutage: false,
   });
   for (const [key, entry] of state.refreshes) {
     if (!key.startsWith(prefix)) continue;

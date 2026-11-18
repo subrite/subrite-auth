@@ -301,158 +301,18 @@ function unique(): string {
 }
 
 describe('outages', () => {
-  it('pauses refreshes for every session of the client, not just the one that failed', async () => {
-    const tick = fakeClock();
-    let isDown = true;
-    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+  const failsFor = (tokens: Array<{ refreshToken: string }>) => {
+    const broken = new Set(tokens.map((token) => token.refreshToken));
+    return ({ form }: { form: URLSearchParams }) =>
+      broken.has(form.get('refresh_token') ?? '')
+        ? new Response('server error', { status: 500 })
+        : rotatingTokens();
+  };
 
-    await refreshAccessToken(sessionToken(), subrite.params);
-    // Other users within the pause keep their tokens and don't reach Subrite.
-    for (let i = 0; i < 20; i += 1) {
-      const token = sessionToken();
-      assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
-    }
-    assert.equal(subrite.calls.token.length, 1);
-
-    tick(10_000);
-    isDown = false;
-    assert.match(
-      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
-      /^access-/,
-    );
-    assert.equal(subrite.calls.token.length, 2);
-    // Back up: no pause any more.
-    assert.match(
-      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
-      /^access-/,
-    );
-    assert.equal(subrite.calls.token.length, 3);
-  });
-
-  it('lets one request check whether Subrite is back while the others wait', async () => {
-    const tick = fakeClock();
-    let release: () => void = () => {};
-    let gate: Promise<void> = Promise.resolve();
-    const subrite = fakeSubrite({
-      token: async () => {
-        await gate;
-        return down();
-      },
-    });
-    await refreshAccessToken(sessionToken(), subrite.params);
-    tick(10_000);
-    gate = new Promise<void>((resolve) => (release = resolve));
-    const probe = refreshAccessToken(sessionToken(), subrite.params);
-    const others = [1, 2, 3].map(() => refreshAccessToken(sessionToken(), subrite.params));
-    await Promise.all(others);
-    release();
-    await probe;
-    assert.equal(subrite.calls.token.length, 2);
-  });
-
-  it('doubles the pause up to 5 minutes', async () => {
-    const tick = fakeClock();
-    const subrite = fakeSubrite({ token: down });
-    const expectedPauses = [10, 20, 40, 80, 160, 300, 300].map((seconds) => seconds * 1000);
-    await refreshAccessToken(sessionToken(), subrite.params);
-    for (const [index, pause] of expectedPauses.entries()) {
-      tick(pause - 1);
-      await refreshAccessToken(sessionToken(), subrite.params);
-      assert.equal(
-        subrite.calls.token.length,
-        index + 1,
-        `still paused after failure ${index + 1}`,
-      );
-      tick(1);
-      await refreshAccessToken(sessionToken(), subrite.params);
-      assert.equal(subrite.calls.token.length, index + 2, `tries again after ${pause / 1000} s`);
-    }
-  });
-
-  it('starts over with 10 s after a success', async () => {
-    const tick = fakeClock();
-    let isDown = true;
-    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
-    await refreshAccessToken(sessionToken(), subrite.params);
-    tick(10_000);
-    await refreshAccessToken(sessionToken(), subrite.params); // second failure: 20 s
-    tick(20_000);
-    isDown = false;
-    await refreshAccessToken(sessionToken(), subrite.params);
-    isDown = true;
-    await refreshAccessToken(sessionToken(), subrite.params);
-    tick(10_000);
-    await refreshAccessToken(sessionToken(), subrite.params);
-    assert.equal(subrite.calls.token.length, 5);
-  });
-
-  it('forgets old failures after 15 minutes', async () => {
-    const tick = fakeClock();
-    const subrite = fakeSubrite({ token: down });
-    await refreshAccessToken(sessionToken(), subrite.params);
-    tick(10_000);
-    await refreshAccessToken(sessionToken(), subrite.params); // second failure in a row
-    tick(16 * MINUTE);
-    await refreshAccessToken(sessionToken(), subrite.params); // a new first failure: 10 s
-    tick(10_000);
-    await refreshAccessToken(sessionToken(), subrite.params);
-    assert.equal(subrite.calls.token.length, 4);
-  });
-
-  it('follows Retry-After, in seconds or as a date', async () => {
-    const tick = fakeClock();
-    const subrite = fakeSubrite({
-      token: () => new Response(null, { status: 503, headers: { 'Retry-After': '120' } }),
-    });
-    await refreshAccessToken(sessionToken(), subrite.params);
-    tick(119_999);
-    await refreshAccessToken(sessionToken(), subrite.params);
-    assert.equal(subrite.calls.token.length, 1);
-    tick(1);
-    await refreshAccessToken(sessionToken(), subrite.params);
-    assert.equal(subrite.calls.token.length, 2);
-
-    const dated = fakeSubrite({
-      token: () =>
-        new Response(null, {
-          status: 429,
-          headers: { 'Retry-After': new Date(Date.now() + 60_000).toUTCString() },
-        }),
-    });
-    await refreshAccessToken(sessionToken(), dated.params);
-    tick(59_000);
-    await refreshAccessToken(sessionToken(), dated.params);
-    assert.equal(dated.calls.token.length, 1);
-    tick(1_000);
-    await refreshAccessToken(sessionToken(), dated.params);
-    assert.equal(dated.calls.token.length, 2);
-  });
-
-  it('keeps sessions of other Subrite clients going', async () => {
-    const broken = fakeSubrite({ token: down });
-    const working = fakeSubrite({ token: rotatingTokens });
-    await refreshAccessToken(sessionToken(), broken.params);
-    assert.match(
-      (await refreshAccessToken(sessionToken(), working.params)).accessToken,
-      /^access-/,
-    );
-  });
-});
-
-describe('outages caused by one account or one moment', () => {
-  it('a refresh token that keeps failing does not hold up other users', async () => {
-    const tick = fakeClock();
+  it('one refresh token failing pauses nobody else', async () => {
+    fakeClock();
     const broken = sessionToken();
-    const subrite = fakeSubrite({
-      token: ({ form }) =>
-        form.get('refresh_token') === broken.refreshToken
-          ? new Response('server error', { status: 500 })
-          : rotatingTokens(),
-    });
-    // The first failure could be an outage, so the client pauses once.
-    await refreshAccessToken(broken, subrite.params);
-    tick(10_000);
-    // The same token fails again: only that token waits longer. Everyone else carries on.
+    const subrite = fakeSubrite({ token: failsFor([broken]) });
     await refreshAccessToken(broken, subrite.params);
     for (let i = 0; i < 5; i += 1) {
       assert.match(
@@ -460,22 +320,65 @@ describe('outages caused by one account or one moment', () => {
         /^access-/,
       );
     }
-    // The broken token itself now waits 20 s.
-    tick(19_999);
-    await refreshAccessToken(broken, subrite.params);
-    const brokenAttempts = () =>
+    assert.equal(subrite.calls.token.length, 6);
+  });
+
+  it('a refresh token that keeps failing waits longer each time, on its own', async () => {
+    const tick = fakeClock();
+    const broken = sessionToken();
+    const subrite = fakeSubrite({ token: failsFor([broken]) });
+    const attempts = () =>
       subrite.calls.token.filter((r) => r.form.get('refresh_token') === broken.refreshToken).length;
-    assert.equal(brokenAttempts(), 2);
-    tick(1);
     await refreshAccessToken(broken, subrite.params);
-    assert.equal(brokenAttempts(), 3);
+    for (const [index, wait] of [10, 20, 40, 80, 160, 300, 300].entries()) {
+      tick(wait * 1000 - 1);
+      await refreshAccessToken(broken, subrite.params);
+      assert.equal(attempts(), index + 1, `still waiting after failure ${index + 1}`);
+      tick(1);
+      await refreshAccessToken(broken, subrite.params);
+      assert.equal(attempts(), index + 2, `tries again after ${wait} s`);
+      assert.match(
+        (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+        /^access-/,
+      );
+    }
+  });
+
+  it('two different refresh tokens failing pause everyone, then one request checks at a time', async () => {
+    const tick = fakeClock();
+    let isDown = true;
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const subrite = fakeSubrite({
+      token: async () => {
+        await gate;
+        return isDown ? down() : rotatingTokens();
+      },
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    for (let i = 0; i < 5; i += 1) {
+      const token = sessionToken();
+      assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
+    }
+    assert.equal(subrite.calls.token.length, 2, 'nobody else reaches Subrite during the pause');
+
+    tick(10_000);
+    isDown = false;
+    gate = new Promise<void>((resolve) => (release = resolve));
+    const probe = refreshAccessToken(sessionToken(), subrite.params);
+    const waiting = sessionToken();
+    assert.deepEqual(await refreshAccessToken(waiting, subrite.params), waiting);
+    release();
+    assert.match((await probe).accessToken, /^access-/);
     assert.match(
       (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
       /^access-/,
     );
+    assert.equal(subrite.calls.token.length, 4);
   });
 
-  it('counts requests that failed together as one failure, so the pause stays at 10 s', async () => {
+  it('counts requests that fail at the same moment as one step, so the pause stays at 10 s', async () => {
     const tick = fakeClock();
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -500,75 +403,143 @@ describe('outages caused by one account or one moment', () => {
     );
   });
 
-  it('keeps others waiting until the probe answers, even if a failing token answers first', async () => {
+  it('waits longer only when a refresh token that had not failed yet fails', async () => {
     const tick = fakeClock();
-    const broken = sessionToken();
-    let releaseBroken: () => void = () => {};
-    let brokenGate: Promise<void> = Promise.resolve();
-    let releaseProbe: () => void = () => {};
-    let probeGate: Promise<void> | undefined = undefined;
-    let isDown = false;
-    const subrite = fakeSubrite({
-      token: async ({ form }) => {
-        if (form.get('refresh_token') === broken.refreshToken) {
-          await brokenGate;
-          return new Response('server error', { status: 500 });
-        }
-        if (probeGate) {
-          await probeGate;
-          return rotatingTokens();
-        }
-        return isDown ? down() : rotatingTokens();
-      },
-    });
-    // The broken token fails once, then Subrite answers others again.
-    await refreshAccessToken(broken, subrite.params);
+    const subrite = fakeSubrite({ token: down });
+    const first = sessionToken();
+    await refreshAccessToken(first, subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params); // outage: 10 s
     tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params); // a new token fails: 20 s
+    tick(19_999);
     await refreshAccessToken(sessionToken(), subrite.params);
-    // The broken token tries again (slowly) while the client is healthy.
-    brokenGate = new Promise<void>((resolve) => (releaseBroken = resolve));
-    const brokenAgain = refreshAccessToken(broken, subrite.params);
-    // Now an outage begins, and after the pause a probe starts.
-    isDown = true;
+    assert.equal(subrite.calls.token.length, 3);
+    tick(1);
+    // `first` already failed in this outage. Its failure is no news: 20 s again, not 40 s.
+    await refreshAccessToken(first, subrite.params);
+    assert.equal(subrite.calls.token.length, 4);
+    tick(20_000);
     await refreshAccessToken(sessionToken(), subrite.params);
-    tick(10_000);
-    probeGate = new Promise<void>((resolve) => (releaseProbe = resolve));
-    const probe = refreshAccessToken(sessionToken(), subrite.params);
-    // The broken token's answer arrives first. It must not let everyone through.
-    releaseBroken();
-    await brokenAgain;
-    const callsBefore = subrite.calls.token.length;
-    const waiting = sessionToken();
-    assert.deepEqual(await refreshAccessToken(waiting, subrite.params), waiting);
-    assert.equal(subrite.calls.token.length, callsBefore, 'still waiting for the probe');
-    releaseProbe();
-    assert.match((await probe).accessToken, /^access-/);
+    assert.equal(subrite.calls.token.length, 5);
   });
 
-  it('forgets an outage that ended long ago', async () => {
+  it('doubles the pause up to 5 minutes while new refresh tokens keep failing', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: down });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    let expected = 2;
+    for (const pause of [10, 20, 40, 80, 160, 300, 300]) {
+      tick(pause * 1000 - 1);
+      await refreshAccessToken(sessionToken(), subrite.params);
+      assert.equal(subrite.calls.token.length, expected, `still paused within ${pause} s`);
+      tick(1);
+      await refreshAccessToken(sessionToken(), subrite.params);
+      expected += 1;
+      assert.equal(subrite.calls.token.length, expected, `one probe after ${pause} s`);
+    }
+  });
+
+  it('lets every user refresh as soon as Subrite answers again', async () => {
     const tick = fakeClock();
     let isDown = true;
-    let release: () => void = () => {};
-    let gate: Promise<void> = Promise.resolve();
-    const subrite = fakeSubrite({
-      token: async () => {
-        await gate;
-        return isDown ? down() : rotatingTokens();
-      },
-    });
-    await refreshAccessToken(sessionToken(), subrite.params);
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+    const users = [sessionToken(), sessionToken(), sessionToken()];
+    for (const user of users) await refreshAccessToken(user, subrite.params);
+    // The outage goes on. The users who check fail again, and their own waits grow.
+    tick(10_000);
+    await refreshAccessToken(users[0], subrite.params);
+    tick(10_000);
+    await refreshAccessToken(users[1], subrite.params); // its own next try: in 20 s
     isDown = false;
-    tick(3 * 60 * MINUTE);
-    // Two users refresh at the same time. Neither has to wait for the other.
-    gate = new Promise<void>((resolve) => (release = resolve));
-    const both = [
-      refreshAccessToken(sessionToken(), subrite.params),
-      refreshAccessToken(sessionToken(), subrite.params),
-    ];
-    release();
-    for (const result of await Promise.all(both)) {
-      assert.match(result.accessToken, /^access-/);
+    tick(10_000);
+    assert.match((await refreshAccessToken(users[2], subrite.params)).accessToken, /^access-/);
+    // The others don't sit out their own waits: the failures were Subrite's, not theirs.
+    for (const user of users.slice(0, 2)) {
+      assert.match((await refreshAccessToken(user, subrite.params)).accessToken, /^access-/);
     }
+  });
+
+  it('several broken accounts never lock out healthy users', async () => {
+    const tick = fakeClock();
+    const broken = [sessionToken(), sessionToken(), sessionToken()];
+    const subrite = fakeSubrite({ token: failsFor(broken) });
+    // Two broken accounts failing first looks like an outage.
+    await refreshAccessToken(broken[0], subrite.params);
+    await refreshAccessToken(broken[1], subrite.params);
+    // The third one checks after the pause. Still failing: the pause grows once, to 20 s.
+    tick(10_000);
+    await refreshAccessToken(broken[2], subrite.params);
+    // The first one checks next. That is no news, so the pause stays at 20 s.
+    tick(20_000);
+    await refreshAccessToken(broken[0], subrite.params);
+    tick(20_000);
+    // A healthy user checks next, gets through, and ends the outage.
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+    // The broken accounts are forgiven once, fail again, and pause nobody.
+    for (const account of broken) await refreshAccessToken(account, subrite.params);
+    for (let i = 0; i < 3; i += 1) {
+      assert.match(
+        (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+        /^access-/,
+      );
+    }
+  });
+
+  it('does not add up single failures far apart', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: down });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(16 * MINUTE);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 3, 'two failures 16 minutes apart are no outage');
+  });
+
+  it('follows Retry-After, in seconds or as a date', async () => {
+    const tick = fakeClock();
+    const retryIn120 = () => new Response(null, { status: 503, headers: { 'Retry-After': '120' } });
+    // For one refresh token.
+    const single = fakeSubrite({ token: retryIn120 });
+    const token = sessionToken();
+    await refreshAccessToken(token, single.params);
+    tick(119_999);
+    await refreshAccessToken(token, single.params);
+    assert.equal(single.calls.token.length, 1);
+    tick(1);
+    await refreshAccessToken(token, single.params);
+    assert.equal(single.calls.token.length, 2);
+
+    // For the whole client during an outage.
+    const outage = fakeSubrite({ token: retryIn120 });
+    await refreshAccessToken(sessionToken(), outage.params);
+    await refreshAccessToken(sessionToken(), outage.params);
+    tick(119_999);
+    await refreshAccessToken(sessionToken(), outage.params);
+    assert.equal(outage.calls.token.length, 2);
+    tick(1);
+    await refreshAccessToken(sessionToken(), outage.params);
+    assert.equal(outage.calls.token.length, 3);
+
+    // As an HTTP date.
+    const dated = fakeSubrite({
+      token: () =>
+        new Response(null, {
+          status: 429,
+          headers: { 'Retry-After': new Date(Date.now() + 60_000).toUTCString() },
+        }),
+    });
+    const datedToken = sessionToken();
+    await refreshAccessToken(datedToken, dated.params);
+    tick(59_000);
+    await refreshAccessToken(datedToken, dated.params);
+    assert.equal(dated.calls.token.length, 1);
+    tick(1_000);
+    await refreshAccessToken(datedToken, dated.params);
+    assert.equal(dated.calls.token.length, 2);
   });
 
   it('a clock that goes backwards ends a pause instead of stretching it', async () => {
@@ -577,11 +548,23 @@ describe('outages caused by one account or one moment', () => {
     let isDown = true;
     const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
     await refreshAccessToken(sessionToken(), subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
     isDown = false;
     // NTP sets the clock an hour back. Without care, the pause would last another hour.
     mock.timers.setTime(start - 60 * MINUTE);
     assert.match(
       (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+  });
+
+  it('keeps sessions of other Subrite clients going', async () => {
+    const broken = fakeSubrite({ token: down });
+    const working = fakeSubrite({ token: rotatingTokens });
+    await refreshAccessToken(sessionToken(), broken.params);
+    await refreshAccessToken(sessionToken(), broken.params);
+    assert.match(
+      (await refreshAccessToken(sessionToken(), working.params)).accessToken,
       /^access-/,
     );
   });

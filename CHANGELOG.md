@@ -43,10 +43,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   off or has no tokens, redirects, 5xx, 429, firewall or CDN pages, and client configuration
   errors such as `invalid_client`, `unauthorized_client` or `invalid_request`. That refresh
   token waits 10 seconds (or as long as `Retry-After` says), doubling with each failure in a row
-  up to 5 minutes. When a refresh token that worked before fails, refreshes for the whole Subrite
-  client pause the same way and one request at a time checks whether Subrite is back. Requests
-  that fail together count once, and a refresh token that keeps failing on its own never holds
-  up other users.
+  up to 5 minutes, so a refresh token that keeps failing only delays itself. When two different
+  refresh tokens fail with no answer from Subrite in between, all refreshes for that Subrite
+  client pause the same way and one request at a time checks whether Subrite is back. As soon as
+  Subrite answers, everyone refreshes right away.
 - Sessions that 0.2.1 marked with `RefreshAccessTokenError` after a temporary failure recover on
   the next refresh.
 - Requests that hold the same refresh token share one refresh within a server process, also
