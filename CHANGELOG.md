@@ -33,10 +33,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - A temporary failure (network error, timeout, 5xx, 429) no longer marks the session with
   `RefreshAccessTokenError`. The token is left as is and the refresh is tried again after 10
   seconds.
-- When Subrite rejects the refresh token, the token is marked with `RefreshAccessTokenError` and
-  Subrite is not called again for that session.
+- When Subrite rejects the refresh token, the token is marked with `RefreshAccessTokenError`, the
+  rejected refresh token is removed, and Subrite is not called again for that session.
+- Sessions that 0.2.1 marked with `RefreshAccessTokenError` after a temporary failure recover on
+  the next refresh. 0.2.1 never removed the mark.
 - Parallel requests in the same server process share one refresh, so a rotated refresh token is
-  never sent twice.
+  never sent twice. Results are never shared between different Subrite servers or clients.
 - `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, and
   authenticates the same way as the sign in (HTTP Basic, unless Subrite only supports
   `client_secret_post`).

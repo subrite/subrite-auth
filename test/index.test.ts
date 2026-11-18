@@ -1,89 +1,14 @@
 import assert from 'node:assert/strict';
-import { afterEach, beforeEach, describe, it, mock } from 'node:test';
-import { inspect } from 'node:util';
+import { describe, it } from 'node:test';
 import Subrite, {
   generatePostSignOutUrl,
   isAccessTokenExpired,
   refreshAccessToken,
   toSubriteJWT,
-  type RefreshParams,
-  type SubriteJWT,
 } from '../src/index.ts';
+import { captureConsole, fakeSubrite, ok, sessionToken } from './helpers.ts';
 
-let counter = 0;
-function unique(prefix: string): string {
-  counter += 1;
-  return `${prefix}-${counter}`;
-}
-
-type TokenRequest = { headers: Headers; form: URLSearchParams; signal?: AbortSignal | null };
-type TokenHandler = (request: TokenRequest) => Response | Promise<Response>;
-
-// A fake Subrite server. Every call gets its own URL so the module caches don't leak between tests.
-function fakeSubrite(options: {
-  token: TokenHandler;
-  discovery?: Record<string, unknown>;
-  discoveryStatus?: number;
-}) {
-  const subriteUrl = `https://${unique('subrite')}.example.com`;
-  const tokenEndpoint = `${subriteUrl}/api/oidc/token`;
-  const calls = { discovery: 0, token: [] as TokenRequest[] };
-  mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
-    if (url === `${subriteUrl}/api/oidc/.well-known/openid-configuration`) {
-      calls.discovery += 1;
-      if (options.discoveryStatus) {
-        return new Response('nope', { status: options.discoveryStatus });
-      }
-      return Response.json({
-        issuer: `${subriteUrl}/api/oidc`,
-        token_endpoint: tokenEndpoint,
-        token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
-        ...options.discovery,
-      });
-    }
-    if (url === tokenEndpoint) {
-      const request: TokenRequest = {
-        headers: new Headers(init?.headers),
-        form: new URLSearchParams(String(init?.body)),
-        signal: init?.signal,
-      };
-      calls.token.push(request);
-      return options.token(request);
-    }
-    throw new Error(`Unexpected fetch: ${url}`);
-  });
-  const params: RefreshParams = { subriteUrl, clientId: 'client id', clientSecret: 's3cret:+' };
-  return { subriteUrl, calls, params };
-}
-
-function sessionToken(overrides: Partial<SubriteJWT> = {}) {
-  return {
-    sub: 'user-1',
-    name: 'Ada',
-    accessToken: unique('old-access'),
-    refreshToken: unique('old-refresh'),
-    accessTokenExpires: Date.now() - 1000,
-    ...overrides,
-  };
-}
-
-const ok = (body: Record<string, unknown>) => Response.json(body);
-
-let consoleError: ReturnType<typeof mock.method>;
-beforeEach(() => {
-  consoleError = mock.method(console, 'error', () => {});
-});
-afterEach(() => {
-  mock.restoreAll();
-});
-
-// What console.error would have printed.
-function loggedText(): string {
-  return consoleError.mock.calls
-    .map((call) => call.arguments.map((arg) => inspect(arg, { depth: 10 })).join(' '))
-    .join('\n');
-}
+const loggedText = captureConsole();
 
 describe('Subrite provider', () => {
   it('uses the OpenID configuration with PKCE, state and offline access', () => {
@@ -269,6 +194,7 @@ describe('refreshAccessToken', () => {
     const refreshed = await refreshAccessToken(token, subrite.params);
     assert.equal(refreshed.error, 'RefreshAccessTokenError');
     assert.equal(refreshed.accessToken, token.accessToken);
+    assert.equal(refreshed.refreshToken, '', 'the rejected refresh token is dropped');
     assert.match(loggedText(), /invalid_grant/);
     assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
 
@@ -284,7 +210,7 @@ describe('refreshAccessToken', () => {
     const token = sessionToken();
     const refreshed = await refreshAccessToken(token, subrite.params);
     assert.equal(refreshed.error, 'RefreshAccessTokenError');
-    assert.ok(consoleError.mock.callCount() > 0);
+    assert.notEqual(loggedText(), '');
     assert.doesNotMatch(loggedText(), /secret-access|secret-refresh/);
     assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
   });
@@ -395,5 +321,19 @@ describe('refreshAccessToken', () => {
     const refreshed = await refreshAccessToken(token, subrite.params);
     assert.equal(refreshed.error, 'RefreshAccessTokenError');
     assert.equal(subrite.calls.discovery, 0);
+  });
+});
+
+describe('refresh sharing', () => {
+  it('never shares a result between two Subrite servers', async () => {
+    const first = fakeSubrite({ token: () => ok({ access_token: 'from-first', expires_in: 60 }) });
+    const token = sessionToken();
+    assert.equal((await refreshAccessToken(token, first.params)).accessToken, 'from-first');
+
+    const second = fakeSubrite({
+      token: () => ok({ access_token: 'from-second', expires_in: 60 }),
+    });
+    assert.equal((await refreshAccessToken(token, second.params)).accessToken, 'from-second');
+    assert.equal(second.calls.token.length, 1);
   });
 });

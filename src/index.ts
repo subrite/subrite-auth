@@ -134,7 +134,8 @@ type RefreshOutcome =
 
 type RefreshEntry = { outcome: Promise<RefreshOutcome>; reuseUntil: number };
 
-// Refreshes in progress or recently finished in this process, keyed by refresh token.
+// Refreshes in progress or recently finished in this process, keyed by Subrite URL, client id
+// and refresh token.
 // Parallel requests share one call to Subrite, so a rotated refresh token is never sent twice.
 const refreshes = new Map<string, RefreshEntry>();
 
@@ -142,22 +143,27 @@ const refreshes = new Map<string, RefreshEntry>();
  * Gets a new access token from Subrite.
  *
  * Never throws. When Subrite rejects the refresh token, the returned token has
- * `error: 'RefreshAccessTokenError'` and the user must sign in again. Further calls with that
- * token return it as is, without calling Subrite. On a temporary failure (network error,
- * timeout, 5xx, 429) the token is returned unchanged, and the refresh is tried again later.
+ * `error: 'RefreshAccessTokenError'` and an empty `refreshToken`, and the user must sign in
+ * again. Further calls with that token return it as is, without calling Subrite. On a temporary
+ * failure (network error, timeout, 5xx, 429) the token is returned unchanged, and the refresh is
+ * tried again later.
  */
 export async function refreshAccessToken(
   token: JWT & SubriteJWT,
   params: RefreshParams,
 ): Promise<JWT & SubriteJWT> {
-  if (token.error === REFRESH_ERROR) {
-    return token;
-  }
   const { refreshToken } = token;
   if (typeof refreshToken !== 'string' || !refreshToken) {
+    // Already flagged: the user must sign in again, and there is nothing to send to Subrite.
+    if (token.error === REFRESH_ERROR) {
+      return token;
+    }
     console.error('Error refreshing access token: the token has no refresh token');
-    return { ...token, error: REFRESH_ERROR };
+    return { ...token, refreshToken: '', error: REFRESH_ERROR };
   }
+  // A token can still carry `error` with a working refresh token. Version 0.2.1 set it on any
+  // failure, including a network blip, and never cleared it. Try the refresh: on success the
+  // error is removed.
 
   const outcome = await sharedRefresh(refreshToken, params);
   switch (outcome.kind) {
@@ -172,7 +178,8 @@ export async function refreshAccessToken(
       return refreshed;
     }
     case 'permanent-failure':
-      return { ...token, error: REFRESH_ERROR };
+      // Drop the rejected refresh token, so it is never sent to Subrite again.
+      return { ...token, refreshToken: '', error: REFRESH_ERROR };
     case 'temporary-failure':
       return token;
   }
@@ -185,7 +192,9 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
       refreshes.delete(key);
     }
   }
-  const existing = refreshes.get(refreshToken);
+  // One app can talk to several Subrite servers or clients. Never share results between them.
+  const key = JSON.stringify([String(params.subriteUrl), params.clientId, refreshToken]);
+  const existing = refreshes.get(key);
   if (existing) {
     return existing.outcome;
   }
@@ -194,7 +203,7 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
     // Keep the entry while the request is in progress. Set the real deadline once it finishes.
     reuseUntil: Number.POSITIVE_INFINITY,
   };
-  refreshes.set(refreshToken, entry);
+  refreshes.set(key, entry);
   entry.outcome.then((outcome) => {
     entry.reuseUntil = Date.now() + reuseTime(outcome);
   });
