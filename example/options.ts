@@ -1,5 +1,10 @@
 import type { NextAuthOptions } from 'next-auth';
-import Subrite, { isAccessTokenExpired, refreshAccessToken, toSubriteJWT } from '../src';
+import Subrite, {
+  isAccessTokenExpired,
+  refreshAccessToken,
+  revokeRefreshToken,
+  toSubriteJWT,
+} from '../src';
 
 const subriteConfig = {
   clientId: 'your-client-id',
@@ -9,6 +14,12 @@ const subriteConfig = {
 
 export const options: NextAuthOptions = {
   providers: [Subrite(subriteConfig)],
+  events: {
+    // The refresh token keeps working after the user signs out of Subrite, so revoke it.
+    async signOut({ token }) {
+      await revokeRefreshToken(token, subriteConfig);
+    },
+  },
   callbacks: {
     async jwt({ token, account }) {
       if (account) {
@@ -19,7 +30,8 @@ export const options: NextAuthOptions = {
         };
       }
 
-      // Return previous token if the access token has not expired yet
+      // Return previous token if the access token has not expired yet.
+      // The token counts as expired one minute early, so it doesn't run out mid request.
       if (!isAccessTokenExpired(token)) {
         return token;
       }

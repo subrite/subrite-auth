@@ -1,8 +1,9 @@
-// The NextAuth configuration from the README, as an app would write it.
+// Copied from the README. scripts/test-package.ts checks that it still matches.
 import type { NextAuthOptions } from 'next-auth';
 import Subrite, {
   isAccessTokenExpired,
   refreshAccessToken,
+  revokeRefreshToken,
   toSubriteJWT,
 } from '@subrite/next-auth-provider';
 
@@ -14,6 +15,12 @@ const subriteConfig = {
 
 export const options: NextAuthOptions = {
   providers: [Subrite(subriteConfig)],
+  events: {
+    // The refresh token keeps working after the user signs out of Subrite, so revoke it.
+    async signOut({ token }) {
+      await revokeRefreshToken(token, subriteConfig);
+    },
+  },
   callbacks: {
     async jwt({ token, account }) {
       if (account) {

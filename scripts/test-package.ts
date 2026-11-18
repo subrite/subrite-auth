@@ -16,10 +16,19 @@ function run(command: string, args: string[], cwd = root): void {
 
 // The README components in the fixture app must match the README, so the docs stay compiled.
 const readme = readFileSync(join(root, 'README.md'), 'utf8');
-const readmeBlocks = [...readme.matchAll(/```tsx\n([\s\S]*?)```/g)].map((match) => match[1]);
+const readmeBlocks = [...readme.matchAll(/```(?:tsx|typescript)\n([\s\S]*?)```/g)].map(
+  (match) => match[1],
+);
 const copyHeader =
   '// Copied from the README. scripts/test-package.ts checks that it still matches.\n';
-for (const file of ['sign-out-button.tsx', 'logout-page.tsx', 'session-guard.tsx']) {
+const copies = [
+  'options.ts',
+  'next-auth.d.ts',
+  'sign-out-button.tsx',
+  'logout-page.tsx',
+  'session-guard.tsx',
+];
+for (const file of copies) {
   const copy = readFileSync(join(fixtures, 'current', file), 'utf8');
   if (!copy.startsWith(copyHeader) || !readmeBlocks.includes(copy.slice(copyHeader.length))) {
     throw new Error(`test/package/current/${file} no longer matches its code block in README.md`);

@@ -23,36 +23,42 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 - `isAccessTokenExpired(token, marginSeconds = 60)`. Refreshes a little before the access token
   expires, so it doesn't run out in the middle of a request.
+- `revokeRefreshToken(token, params)`. Revokes the refresh token at Subrite, for example from
+  `events.signOut`. Refresh tokens for offline access keep working after the user signs out of
+  Subrite.
 - `generatePostSignOutUrl` takes `{ state, idTokenHint }`. The README shows how `state` stops
   other sites from signing your users out.
+- `refreshAccessToken` takes optional `timeoutMs` (default 10 seconds), `client` and
+  `oldCookieGraceSeconds`.
 - `SubriteSession`, `SubriteTokenError`, `RefreshParams` and `SignOutOptions` types.
   `subriteUrl` accepts a `URL` as well as a string.
-- `refreshAccessToken` takes an optional `timeoutMs` (default 10 seconds) and `client`.
 
 ### Fixed
 
 - `refreshAccessToken` no longer writes tokens to the log.
-- Only an OAuth error from Subrite that rejects the token (such as `invalid_grant`) marks the
-  session with `RefreshAccessTokenError`. Then the rejected refresh token is removed and Subrite
-  is not asked again for that session. In 0.2.1 any failure, even a network blip, set the error
-  for good.
-- Other failures leave the token as is: network errors, timeouts, a response that breaks off,
-  5xx, 408, 429, `invalid_client`, and client errors without an OAuth error code (a firewall or
-  CDN page). The refresh is tried again after 10 seconds, waiting twice as long after each
-  failure in a row, up to 5 minutes.
+- Only `invalid_grant` from Subrite marks the session with `RefreshAccessTokenError`. Then the
+  rejected refresh token is removed and Subrite is not asked again for that session. In 0.2.1 any
+  failure, even a network blip, set the error for good.
+- Every other failure leaves the token as is: network errors, timeouts, a response that breaks
+  off, redirects, 5xx, 429, firewall or CDN pages, and client configuration errors such as
+  `invalid_client`, `unauthorized_client` or `invalid_request`. Refreshes for that Subrite client
+  then pause for 10 seconds (or as long as `Retry-After` says), doubling with each failure in a
+  row up to 5 minutes, and one request at a time checks whether Subrite is back.
 - Sessions that 0.2.1 marked with `RefreshAccessTokenError` after a temporary failure recover on
   the next refresh.
 - Requests that hold the same refresh token share one refresh within a server process, also
-  across the copies of the library that Next.js loads for different routers. A later request
-  with an old cookie gets the new tokens from memory until the new access token is about to
-  expire, instead of sending the used refresh token again. Results are never shared between
-  different Subrite servers or clients.
+  across the copies of the library that Next.js loads for different routers. When Subrite
+  replaced the refresh token, a later request with an old cookie gets the new tokens from memory
+  until the new access token is about to expire (configurable with `oldCookieGraceSeconds`),
+  instead of sending the used refresh token again. When Subrite kept it, results are shared for
+  30 seconds at most. Results are never shared between different Subrite servers or clients.
 - `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, never
-  follows redirects, and authenticates the same way as the sign in (HTTP Basic, unless Subrite
-  only supports `client_secret_post`).
+  follows redirects (and works on Cloudflare Workers), and authenticates the same way as the sign
+  in (HTTP Basic, unless Subrite only supports `client_secret_post`).
 - A token response without `expires_in` keeps the new tokens and assumes 5 minutes, instead of
   throwing away a refresh token Subrite may already have replaced. `expires_in` may be a numeric
   string.
+- Network errors are logged with their cause, such as `ECONNREFUSED`.
 - The profile picture is read from the standard `picture` claim, falling back to `image`.
 - TypeScript types now resolve with `moduleResolution` set to `bundler`, `node16` or `nodenext`,
   and work with `exactOptionalPropertyTypes`.

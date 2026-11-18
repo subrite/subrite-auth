@@ -1,17 +1,13 @@
 // How refreshAccessToken behaves when things go wrong: odd answers from Subrite or from
-// something in between, slow or broken connections, old cookies and several copies of the
-// library in one process.
+// something in between, slow or broken connections, outages, old cookies and several copies of
+// the library in one process.
 import assert from 'node:assert/strict';
-import { afterEach, describe, it, mock } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import * as library from '../src/index.ts';
-import { generatePostSignOutUrl, refreshAccessToken } from '../src/index.ts';
-import { captureConsole, fakeSubrite, ok, sessionToken } from './helpers.ts';
+import { generatePostSignOutUrl, refreshAccessToken, revokeRefreshToken } from '../src/index.ts';
+import { captureConsole, fakeSubrite, libraryState, ok, sessionToken } from './helpers.ts';
 
 const loggedText = captureConsole();
-
-afterEach(() => {
-  mock.timers.reset();
-});
 
 // Lets a test move the clock forward. Only Date is faked: fetch and timeouts use real timers.
 function fakeClock() {
@@ -19,51 +15,66 @@ function fakeClock() {
   return (ms: number) => mock.timers.tick(ms);
 }
 
-const newTokens = () =>
-  ok({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600 });
+const MINUTE = 60_000;
+
+// Subrite replaces the refresh token on every refresh (rotation).
+let rotation = 0;
+const rotatingTokens = () => {
+  rotation += 1;
+  return ok({
+    access_token: `access-${rotation}`,
+    refresh_token: `refresh-${rotation}`,
+    expires_in: 3600,
+  });
+};
+// Subrite keeps the refresh token (node-oidc-provider's default for confidential clients).
+const keptTokens = () => ok({ access_token: `access-${(rotation += 1)}`, expires_in: 3600 });
+
+const down = () => new Response('down', { status: 503 });
+const rejected = () => Response.json({ error: 'invalid_grant' }, { status: 400 });
 
 describe('what counts as a rejected refresh token', () => {
-  const cases: Array<[string, () => Response, 'rejected' | 'temporary']> = [
+  const cases: Array<[string, () => Response, 'rejected' | 'kept']> = [
+    ['400 invalid_grant', rejected, 'rejected'],
     [
-      '400 invalid_grant',
-      () => Response.json({ error: 'invalid_grant' }, { status: 400 }),
-      'rejected',
-    ],
-    [
-      '400 unauthorized_client',
-      () => Response.json({ error: 'unauthorized_client' }, { status: 400 }),
+      '401 invalid_grant',
+      () => Response.json({ error: 'invalid_grant' }, { status: 401 }),
       'rejected',
     ],
     [
       '401 invalid_client (wrong client secret)',
       () => Response.json({ error: 'invalid_client' }, { status: 401 }),
-      'temporary',
+      'kept',
+    ],
+    [
+      '400 invalid_request (empty client secret)',
+      () => Response.json({ error: 'invalid_request' }, { status: 400 }),
+      'kept',
+    ],
+    [
+      '400 unauthorized_client (grant not allowed for the client)',
+      () => Response.json({ error: 'unauthorized_client' }, { status: 400 }),
+      'kept',
+    ],
+    [
+      '400 unsupported_grant_type',
+      () => Response.json({ error: 'unsupported_grant_type' }, { status: 400 }),
+      'kept',
     ],
     [
       '403 HTML page from a firewall',
       () => new Response('<html>Forbidden</html>', { status: 403 }),
-      'temporary',
+      'kept',
     ],
-    [
-      '404 without a body (deploy in progress)',
-      () => new Response(null, { status: 404 }),
-      'temporary',
-    ],
-    [
-      '408 request timeout',
-      () => Response.json({ error: 'timeout' }, { status: 408 }),
-      'temporary',
-    ],
-    [
-      '429 too many requests',
-      () => Response.json({ error: 'slow_down' }, { status: 429 }),
-      'temporary',
-    ],
-    ['502 bad gateway', () => new Response('bad gateway', { status: 502 }), 'temporary'],
+    ['404 without a body (deploy in progress)', () => new Response(null, { status: 404 }), 'kept'],
+    ['408 request timeout', () => Response.json({ error: 'timeout' }, { status: 408 }), 'kept'],
+    ['425 too early', () => new Response(null, { status: 425 }), 'kept'],
+    ['429 too many requests', () => Response.json({ error: 'slow_down' }, { status: 429 }), 'kept'],
+    ['502 bad gateway', () => new Response('bad gateway', { status: 502 }), 'kept'],
   ];
 
   for (const [name, respond, expected] of cases) {
-    it(`${name} is ${expected}`, async () => {
+    it(`${name}: ${expected === 'rejected' ? 'the user must sign in again' : 'the session is kept'}`, async () => {
       const subrite = fakeSubrite({ token: respond });
       const token = sessionToken();
       const refreshed = await refreshAccessToken(token, subrite.params);
@@ -76,12 +87,12 @@ describe('what counts as a rejected refresh token', () => {
     });
   }
 
-  it('explains invalid_client in the log', async () => {
+  it('points to the configuration for client errors that are not about the token', async () => {
     const subrite = fakeSubrite({
       token: () => Response.json({ error: 'invalid_client' }, { status: 401 }),
     });
     await refreshAccessToken(sessionToken(), subrite.params);
-    assert.match(loggedText(), /client id or secret/);
+    assert.match(loggedText(), /client configuration/);
   });
 });
 
@@ -105,97 +116,421 @@ describe('broken responses', () => {
     assert.doesNotMatch(loggedText(), /secret-acc/);
   });
 
-  it('never follows redirects', async () => {
-    const subrite = fakeSubrite({ token: newTokens });
-    await refreshAccessToken(sessionToken(), subrite.params);
-    assert.deepEqual(subrite.calls.redirects, ['error', 'error']);
+  it('never follows a redirect and keeps the session', async () => {
+    const subrite = fakeSubrite({
+      token: () =>
+        new Response(null, {
+          status: 307,
+          headers: { Location: 'https://elsewhere.example/steal' },
+        }),
+    });
+    const token = sessionToken();
+    assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
+    // 'manual' hands the 3xx back instead of following it. ('error' fails on Cloudflare Workers.)
+    assert.deepEqual(subrite.calls.redirects, ['manual', 'manual']);
+    assert.deepEqual(subrite.calls.unexpected, []);
+    assert.match(loggedText(), /redirect was not followed/);
   });
 
   it('does not cache an OpenID configuration without token_endpoint', async () => {
-    const subrite = fakeSubrite({ discovery: { token_endpoint: null }, token: newTokens });
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ discovery: { token_endpoint: null }, token: rotatingTokens });
     const token = sessionToken();
     assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
+    tick(10_000);
     await refreshAccessToken(sessionToken(), subrite.params);
     assert.equal(subrite.calls.discovery, 2);
     assert.equal(subrite.calls.token.length, 0);
     assert.match(loggedText(), /no token_endpoint/);
   });
+
+  it('logs the cause of a network error', async () => {
+    const subrite = fakeSubrite({
+      token: () => {
+        throw new TypeError('fetch failed', {
+          cause: Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:443'), {
+            code: 'ECONNREFUSED',
+          }),
+        });
+      },
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.match(loggedText(), /fetch failed \(ECONNREFUSED: connect ECONNREFUSED/);
+  });
+
+  it('lets each caller keep its own timeout while the OpenID configuration loads', async () => {
+    let releaseDiscovery: () => void = () => {};
+    const discoveryGate = new Promise<void>((resolve) => (releaseDiscovery = resolve));
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const fakeFetch = globalThis.fetch;
+    mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('openid-configuration')) {
+        // Like a real fetch: stop waiting when the request's own signal aborts.
+        await new Promise<void>((resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+          discoveryGate.then(resolve);
+        });
+      }
+      return fakeFetch(input, init);
+    });
+    // The first caller gives up quickly. The second one joins the same discovery request.
+    const hasty = refreshAccessToken(sessionToken(), { ...subrite.params, timeoutMs: 20 });
+    const patient = refreshAccessToken(sessionToken(), { ...subrite.params, timeoutMs: 5000 });
+    const keepAlive = setTimeout(() => {}, 5000);
+    try {
+      await hasty;
+      releaseDiscovery();
+      assert.match((await patient).accessToken, /^access-/);
+      assert.equal(subrite.calls.discovery, 1);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
 });
 
-describe('old cookies and retries', () => {
-  it('answers an old cookie from memory until the new access token is about to expire', async () => {
+describe('old cookies', () => {
+  it('when the refresh token was replaced: answers from memory until the new access token is about to expire', async () => {
     const tick = fakeClock();
-    const subrite = fakeSubrite({ token: newTokens });
-    // A request that can't save its cookie, like an App Router Server Component, refreshes.
-    // The browser keeps sending the old cookie.
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    // A Server Component refreshes but can't save the cookie. The browser keeps the old one.
     const oldCookie = sessionToken();
-    await refreshAccessToken(oldCookie, subrite.params);
+    const first = await refreshAccessToken(oldCookie, subrite.params);
 
-    tick(30 * 60 * 1000);
-    const later = await refreshAccessToken(oldCookie, subrite.params);
-    assert.equal(later.accessToken, 'new-access');
-    assert.equal(later.refreshToken, 'new-refresh');
-    assert.equal(subrite.calls.token.length, 1, 'the used refresh token is not sent again');
+    tick(59 * MINUTE - 1);
+    const late = await refreshAccessToken(oldCookie, subrite.params);
+    assert.equal(late.accessToken, first.accessToken);
+    assert.equal(late.refreshToken, first.refreshToken);
+    assert.equal(subrite.calls.token.length, 1, 'the replaced refresh token is not sent again');
 
-    // Close to expiry (3600 s minus the 60 s margin) the entry ends.
-    tick(29 * 60 * 1000 + 1);
+    // 3600 s minus the 60 s margin.
+    tick(1);
     await refreshAccessToken(oldCookie, subrite.params);
     assert.equal(subrite.calls.token.length, 2);
   });
 
-  it('remembers a rejected refresh token for an hour', async () => {
+  it('logs once when an old cookie is answered from memory long after the refresh', async () => {
     const tick = fakeClock();
-    const subrite = fakeSubrite({
-      token: () => Response.json({ error: 'invalid_grant' }, { status: 400 }),
-    });
-    // An old cookie, saved before the token was flagged, keeps arriving.
+    const subrite = fakeSubrite({ token: rotatingTokens });
     const oldCookie = sessionToken();
     await refreshAccessToken(oldCookie, subrite.params);
-    tick(59 * 60 * 1000);
-    const again = await refreshAccessToken(oldCookie, subrite.params);
-    assert.equal(again.error, 'RefreshAccessTokenError');
+    tick(10_000);
+    await refreshAccessToken(oldCookie, subrite.params);
+    assert.doesNotMatch(loggedText(), /got the new tokens from memory/, 'not within 30 s');
+    tick(5 * MINUTE);
+    await refreshAccessToken(oldCookie, subrite.params);
+    await refreshAccessToken(oldCookie, subrite.params);
+    assert.equal(loggedText().match(/got the new tokens from memory/g)?.length, 1);
+    assert.doesNotMatch(loggedText(), new RegExp(oldCookie.refreshToken));
+  });
+
+  it('respects a shorter oldCookieGraceSeconds', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const params = { ...subrite.params, oldCookieGraceSeconds: 45 };
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, params);
+    tick(44_999);
+    await refreshAccessToken(oldCookie, params);
+    assert.equal(subrite.calls.token.length, 1);
+    tick(1);
+    await refreshAccessToken(oldCookie, params);
+    assert.equal(subrite.calls.token.length, 2, 'sent to Subrite, whose reuse detection decides');
+  });
+
+  it('never goes below 30 s, so requests that arrive together share the refresh', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const params = { ...subrite.params, oldCookieGraceSeconds: 0 };
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, params);
+    tick(29_999);
+    await refreshAccessToken(oldCookie, params);
     assert.equal(subrite.calls.token.length, 1);
   });
 
-  it('waits longer after each temporary failure in a row', async () => {
+  it('when the refresh token was kept: asks Subrite again after 30 s', async () => {
     const tick = fakeClock();
-    const subrite = fakeSubrite({ token: () => new Response('down', { status: 503 }) });
+    const subrite = fakeSubrite({ token: keptTokens });
     const token = sessionToken();
-    const attempts = () => subrite.calls.token.length;
+    const first = await refreshAccessToken(token, subrite.params);
+    assert.equal(first.refreshToken, token.refreshToken);
 
-    await refreshAccessToken(token, subrite.params);
-    assert.equal(attempts(), 1);
+    tick(29_999);
+    assert.equal((await refreshAccessToken(token, subrite.params)).accessToken, first.accessToken);
+    assert.equal(subrite.calls.token.length, 1);
 
-    tick(10_000);
-    await refreshAccessToken(token, subrite.params);
-    assert.equal(attempts(), 2, 'tries again after 10 s');
-
-    tick(10_000);
-    await refreshAccessToken(token, subrite.params);
-    assert.equal(attempts(), 2, 'now waits 20 s');
-
-    tick(10_000);
-    await refreshAccessToken(token, subrite.params);
-    assert.equal(attempts(), 3);
-
-    tick(39_999);
-    await refreshAccessToken(token, subrite.params);
-    assert.equal(attempts(), 3, 'now waits 40 s');
+    // A forced refresh (for example after a purchase) or a revocation reaches Subrite.
+    tick(1);
+    const second = await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 2);
+    assert.notEqual(second.accessToken, first.accessToken);
   });
 
-  it('starts the wait over after a success', async () => {
+  it('never hands out an access token that has already expired', async () => {
     const tick = fakeClock();
-    let down = true;
-    const subrite = fakeSubrite({
-      token: () => (down ? new Response('down', { status: 503 }) : newTokens()),
-    });
+    const subrite = fakeSubrite({ token: () => ok({ access_token: unique(), expires_in: 10 }) });
     const token = sessionToken();
     await refreshAccessToken(token, subrite.params);
     tick(10_000);
-    down = false;
-    const refreshed = await refreshAccessToken(token, subrite.params);
-    assert.equal(refreshed.accessToken, 'new-access');
+    await refreshAccessToken(token, subrite.params);
     assert.equal(subrite.calls.token.length, 2);
+  });
+
+  it('remembers a rejected refresh token for an hour, then asks again', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: rejected });
+    const oldCookie = sessionToken();
+    await refreshAccessToken(oldCookie, subrite.params);
+    tick(60 * MINUTE - 1);
+    assert.equal(
+      (await refreshAccessToken(oldCookie, subrite.params)).error,
+      'RefreshAccessTokenError',
+    );
+    assert.equal(subrite.calls.token.length, 1);
+    tick(1);
+    await refreshAccessToken(oldCookie, subrite.params);
+    assert.equal(subrite.calls.token.length, 2);
+  });
+});
+
+let uniqueCounter = 0;
+function unique(): string {
+  uniqueCounter += 1;
+  return `value-${uniqueCounter}`;
+}
+
+describe('outages', () => {
+  it('pauses refreshes for every session of the client, not just the one that failed', async () => {
+    const tick = fakeClock();
+    let isDown = true;
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+
+    await refreshAccessToken(sessionToken(), subrite.params);
+    // Other users within the pause keep their tokens and don't reach Subrite.
+    for (let i = 0; i < 20; i += 1) {
+      const token = sessionToken();
+      assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
+    }
+    assert.equal(subrite.calls.token.length, 1);
+
+    tick(10_000);
+    isDown = false;
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+    assert.equal(subrite.calls.token.length, 2);
+    // Back up: no pause any more.
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+    assert.equal(subrite.calls.token.length, 3);
+  });
+
+  it('lets one request check whether Subrite is back while the others wait', async () => {
+    const tick = fakeClock();
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const subrite = fakeSubrite({
+      token: async () => {
+        await gate;
+        return down();
+      },
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(10_000);
+    gate = new Promise<void>((resolve) => (release = resolve));
+    const probe = refreshAccessToken(sessionToken(), subrite.params);
+    const others = [1, 2, 3].map(() => refreshAccessToken(sessionToken(), subrite.params));
+    await Promise.all(others);
+    release();
+    await probe;
+    assert.equal(subrite.calls.token.length, 2);
+  });
+
+  it('doubles the pause up to 5 minutes', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: down });
+    const expectedPauses = [10, 20, 40, 80, 160, 300, 300].map((seconds) => seconds * 1000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    for (const [index, pause] of expectedPauses.entries()) {
+      tick(pause - 1);
+      await refreshAccessToken(sessionToken(), subrite.params);
+      assert.equal(
+        subrite.calls.token.length,
+        index + 1,
+        `still paused after failure ${index + 1}`,
+      );
+      tick(1);
+      await refreshAccessToken(sessionToken(), subrite.params);
+      assert.equal(subrite.calls.token.length, index + 2, `tries again after ${pause / 1000} s`);
+    }
+  });
+
+  it('starts over with 10 s after a success', async () => {
+    const tick = fakeClock();
+    let isDown = true;
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params); // second failure: 20 s
+    tick(20_000);
+    isDown = false;
+    await refreshAccessToken(sessionToken(), subrite.params);
+    isDown = true;
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 5);
+  });
+
+  it('forgets old failures after 15 minutes', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: down });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params); // second failure in a row
+    tick(16 * MINUTE);
+    await refreshAccessToken(sessionToken(), subrite.params); // a new first failure: 10 s
+    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 4);
+  });
+
+  it('follows Retry-After, in seconds or as a date', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({
+      token: () => new Response(null, { status: 503, headers: { 'Retry-After': '120' } }),
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    tick(119_999);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 1);
+    tick(1);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 2);
+
+    const dated = fakeSubrite({
+      token: () =>
+        new Response(null, {
+          status: 429,
+          headers: { 'Retry-After': new Date(Date.now() + 60_000).toUTCString() },
+        }),
+    });
+    await refreshAccessToken(sessionToken(), dated.params);
+    tick(59_000);
+    await refreshAccessToken(sessionToken(), dated.params);
+    assert.equal(dated.calls.token.length, 1);
+    tick(1_000);
+    await refreshAccessToken(sessionToken(), dated.params);
+    assert.equal(dated.calls.token.length, 2);
+  });
+
+  it('keeps sessions of other Subrite clients going', async () => {
+    const broken = fakeSubrite({ token: down });
+    const working = fakeSubrite({ token: rotatingTokens });
+    await refreshAccessToken(sessionToken(), broken.params);
+    assert.match(
+      (await refreshAccessToken(sessionToken(), working.params)).accessToken,
+      /^access-/,
+    );
+  });
+});
+
+describe('revokeRefreshToken', () => {
+  it('revokes the refresh token at Subrite with the client credentials', async () => {
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const token = sessionToken();
+    assert.equal(await revokeRefreshToken(token, subrite.params), true);
+    const [request] = subrite.calls.revocation;
+    assert.equal(request.form.get('token'), token.refreshToken);
+    assert.equal(request.form.get('token_type_hint'), 'refresh_token');
+    assert.equal(request.headers.get('authorization'), `Basic ${btoa('client+id:s3cret%3A%2B')}`);
+  });
+
+  it('stops answering old cookies from memory', async () => {
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    const oldCookie = sessionToken();
+    const refreshed = await refreshAccessToken(oldCookie, subrite.params);
+    await revokeRefreshToken(refreshed, subrite.params);
+
+    for (const cookie of [oldCookie, refreshed]) {
+      const after = await refreshAccessToken({ ...cookie, accessTokenExpires: 0 }, subrite.params);
+      assert.equal(after.error, 'RefreshAccessTokenError');
+    }
+    assert.equal(subrite.calls.token.length, 1, 'nothing more is sent to Subrite');
+  });
+
+  it('returns false and never throws when Subrite fails or has no revocation endpoint', async () => {
+    const failing = fakeSubrite({ token: rotatingTokens, revocation: () => down() });
+    assert.equal(await revokeRefreshToken(sessionToken(), failing.params), false);
+
+    const without = fakeSubrite({
+      token: rotatingTokens,
+      discovery: { revocation_endpoint: null },
+    });
+    assert.equal(await revokeRefreshToken(sessionToken(), without.params), false);
+    assert.match(loggedText(), /no revocation_endpoint/);
+
+    assert.equal(await revokeRefreshToken({ refreshToken: '' }, failing.params), false);
+  });
+});
+
+describe('cache size', () => {
+  it('never drops a refresh that is still in progress', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const subrite = fakeSubrite({
+      token: async () => {
+        await gate;
+        return rotatingTokens();
+      },
+    });
+    const token = sessionToken();
+    const inFlight = refreshAccessToken(token, subrite.params);
+
+    // Fill the cache past its limit with finished refreshes.
+    const { refreshes } = libraryState();
+    const finished = Promise.resolve({ kind: 'temporary-failure' });
+    for (let i = 0; i < 10_000; i += 1) {
+      refreshes.set(`filler-${i}`, {
+        outcome: finished,
+        settled: { kind: 'temporary-failure' },
+        sentRefreshToken: `filler-${i}`,
+        reuseUntil: Number.POSITIVE_INFINITY,
+      });
+    }
+    // Another refresh makes the cache prune. The one in progress must stay.
+    const other = fakeSubrite({ token: rotatingTokens });
+    await refreshAccessToken(sessionToken(), other.params);
+    assert.ok(refreshes.size <= 10_000);
+
+    const again = refreshAccessToken({ ...token }, subrite.params);
+    release();
+    await Promise.all([inFlight, again]);
+    assert.equal(subrite.calls.token.length, 1, 'the refresh token was sent once');
+  });
+});
+
+describe('clock changes', () => {
+  it('still prunes the cache after the clock went backwards', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start + 60 * MINUTE });
+    const subrite = fakeSubrite({ token: rotatingTokens });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    // The server clock is corrected an hour back (for example by NTP).
+    mock.timers.setTime(start);
+    const { refreshes } = libraryState();
+    refreshes.set('finished-long-ago', {
+      outcome: Promise.resolve({ kind: 'temporary-failure' }),
+      settled: { kind: 'temporary-failure' },
+      sentRefreshToken: 'old',
+      reuseUntil: start - 1,
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(refreshes.has('finished-long-ago'), false);
   });
 });
 
@@ -211,7 +546,7 @@ describe('several copies of the library in one process', () => {
     const subrite = fakeSubrite({
       token: async () => {
         await gate;
-        return newTokens();
+        return rotatingTokens();
       },
     });
     const token = sessionToken();
@@ -223,9 +558,7 @@ describe('several copies of the library in one process', () => {
     const results = await Promise.all(pending);
     assert.equal(subrite.calls.token.length, 1);
     assert.equal(subrite.calls.discovery, 1);
-    for (const result of results) {
-      assert.equal(result.refreshToken, 'new-refresh');
-    }
+    assert.equal(results[0].refreshToken, results[1].refreshToken);
   });
 });
 

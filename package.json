@@ -46,7 +46,7 @@
   "scripts": {
     "compile": "tsup src/index.ts --format cjs,esm --dts --clean --target node22 --external next-auth",
     "typecheck": "tsc",
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --test --test-timeout=30000 \"test/**/*.test.ts\"",
     "test:package": "node scripts/test-package.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

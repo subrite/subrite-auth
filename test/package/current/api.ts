@@ -4,8 +4,10 @@ import Subrite, {
   generatePostSignOutUrl,
   isAccessTokenExpired,
   refreshAccessToken,
+  revokeRefreshToken,
   toSubriteJWT,
   type RefreshParams,
+  type SignOutOptions,
   type SubriteConfig,
   type SubriteJWT,
   type SubriteProfile,
@@ -26,9 +28,21 @@ export const signOutUrl: string = generatePostSignOutUrl('https://a.example', 'i
   state: 'state',
 });
 
+const params: RefreshParams = {
+  subriteUrl: 'https://a.example',
+  clientId: 'id',
+  clientSecret: 'secret',
+  oldCookieGraceSeconds: 30,
+};
+export const revoked: Promise<boolean> = revokeRefreshToken({ refreshToken: 'r' }, params);
+
+// @ts-expect-error oldCookieGraceSeconds is a number of seconds
+export const badParams: RefreshParams = { ...params, oldCookieGraceSeconds: '30' };
+
 export const values = { notANumber, refreshAccessToken, toSubriteJWT };
 export type Types = [
   RefreshParams,
+  SignOutOptions,
   SubriteConfig,
   SubriteJWT,
   SubriteProfile,

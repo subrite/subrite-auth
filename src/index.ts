@@ -48,6 +48,16 @@ export type RefreshParams = {
   client?: { token_endpoint_auth_method?: string };
   /** How long to wait for Subrite before giving up. Defaults to 10 seconds. */
   timeoutMs?: number;
+  /**
+   * When Subrite replaces the refresh token, how long a request that still carries the old one
+   * (an old cookie) gets the new tokens from memory instead of sending the old token again.
+   *
+   * Defaults to the lifetime of the new access token (minus one minute). That is what App
+   * Router Server Components need, because they can't save the refreshed cookie. If your app
+   * always saves refreshed cookies right away, set it low (30 is the minimum): an old cookie used
+   * later is then sent to Subrite, whose reuse detection can end the stolen session.
+   */
+  oldCookieGraceSeconds?: number;
 };
 
 export type SignOutOptions = {
@@ -63,19 +73,20 @@ export type SignOutOptions = {
 const WELL_KNOWN_PATH = 'api/oidc/.well-known/openid-configuration';
 const SIGN_OUT_PATH = 'api/oidc/session/end';
 const REFRESH_ERROR: SubriteTokenError = 'RefreshAccessTokenError';
+const SUPPORTED_AUTH_METHODS = ['client_secret_basic', 'client_secret_post'];
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_EXPIRY_MARGIN_SECONDS = 60;
-// A successful refresh is shared with later requests that still carry the old refresh token (an
-// old cookie) for at least this long, and until the new access token is about to expire.
+// Requests that arrive together share one refresh. A result is reused at least this long.
 const MIN_SUCCESS_REUSE_MS = 30_000;
 // A rejected refresh token is answered from memory for this long, without asking Subrite again.
 const PERMANENT_FAILURE_REUSE_MS = 60 * 60 * 1000;
-// After a temporary failure, wait before trying the same refresh token again. The wait doubles
-// with every failure in a row, up to the maximum.
+// After a failure that isn't about the token (network, timeout, 5xx, 429, configuration),
+// refreshes for that Subrite client pause, then one request tries again. The pause doubles with
+// every failure in a row, up to the maximum, unless Subrite says how long with Retry-After.
 const BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
-// How long failures in a row are remembered for the back off.
+// Failures further apart than this don't count as in a row.
 const FAILURE_MEMORY_MS = 15 * 60 * 1000;
 // Used when Subrite leaves out expires_in. Short, so a real expiry is missed by little.
 const FALLBACK_EXPIRES_IN_SECONDS = 300;
@@ -85,6 +96,13 @@ const PRUNE_INTERVAL_MS = 10_000;
 const DISCOVERY_CACHE_MS = 60 * 60 * 1000;
 
 export default function Subrite(config: SubriteConfig): OAuthConfig<SubriteProfile> {
+  const authMethod = config.client?.token_endpoint_auth_method;
+  if (authMethod !== undefined && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
+    console.error(
+      `Subrite: token_endpoint_auth_method ${authMethod} works for sign in, but ` +
+        'refreshAccessToken only supports client_secret_basic and client_secret_post.',
+    );
+  }
   return {
     id: 'subrite',
     name: 'Subrite',
@@ -155,42 +173,65 @@ export function isAccessTokenExpired(
 type RefreshOutcome =
   | { kind: 'success'; accessToken: string; refreshToken: string; accessTokenExpires: number }
   | { kind: 'permanent-failure' }
-  | { kind: 'temporary-failure' };
+  | { kind: 'temporary-failure'; retryAfterMs?: number };
+
+const TEMPORARY: RefreshOutcome = { kind: 'temporary-failure' };
+const PERMANENT: RefreshOutcome = { kind: 'permanent-failure' };
 
 type RefreshEntry = {
   outcome: Promise<RefreshOutcome>;
+  /** Set once the request has finished. */
+  settled?: RefreshOutcome;
+  settledAt?: number;
+  /** The refresh token this entry sent to Subrite. */
+  sentRefreshToken: string;
   /** Until when other requests with the same refresh token get this outcome. */
   reuseUntil: number;
-  /** Until when the entry is kept, to count temporary failures in a row. */
-  keepUntil: number;
-  /** Temporary failures in a row for this refresh token. */
+  /** Whether a late reuse of this entry has been logged. */
+  warned?: boolean;
+};
+
+/** How Subrite has been answering for one Subrite URL and client id. */
+type ClientHealth = {
   failures: number;
+  lastFailure: number;
+  /** No new refreshes for this client until then. */
+  pausedUntil: number;
+  /** A refresh is checking whether Subrite is back. Others wait for it. */
+  probing: boolean;
+};
+
+type State = {
+  refreshes: Map<string, RefreshEntry>;
+  clients: Map<string, ClientHealth>;
+  lastPrune: number;
 };
 
 // Next.js can load several copies of this module into one process, for example one for the
-// Pages Router and one per App Router layer. Keep the caches on globalThis so all copies share
-// them. Bump the version in the key if the shape of what is stored changes.
+// Pages Router and one per App Router layer. Keep the state on globalThis so all copies share
+// it. Bump the version in the key if the shape of what is stored changes.
 function processWide<T>(name: string, create: () => T): T {
   const key = Symbol.for(`@subrite/next-auth-provider/v1/${name}`);
   const store = globalThis as unknown as Record<symbol, T | undefined>;
   return (store[key] ??= create());
 }
 
-// Refreshes in progress or recently finished in this process, keyed by Subrite URL, client id
-// and refresh token. Requests with the same refresh token share one call to Subrite, and a
-// request that still carries an already used refresh token gets the result instead of sending
-// it again.
-const refreshes = processWide('refreshes', () => new Map<string, RefreshEntry>());
-let lastPrune = 0;
+// Refreshes in progress or recently finished, keyed by Subrite URL, client id and refresh
+// token. Requests with the same refresh token share one call to Subrite, and a request that
+// still carries a refresh token Subrite has replaced gets the result instead of sending it again.
+const state = processWide<State>('state', () => ({
+  refreshes: new Map(),
+  clients: new Map(),
+  lastPrune: 0,
+}));
 
 /**
  * Gets a new access token from Subrite.
  *
- * Never throws. When Subrite rejects the refresh token, the returned token has
- * `error: 'RefreshAccessTokenError'` and an empty `refreshToken`, and the user must sign in
- * again. Further calls with that token return it as is, without calling Subrite. On a temporary
- * failure (network error, timeout, 5xx, 429, or a client error without an OAuth error code) the
- * token is returned unchanged, and the refresh is tried again later, waiting longer each time.
+ * Never throws. When Subrite rejects the refresh token (`invalid_grant`), the returned token
+ * has `error: 'RefreshAccessTokenError'` and an empty `refreshToken`, and the user must sign in
+ * again. Further calls with that token return it as is, without calling Subrite. Any other
+ * failure leaves the token unchanged, and the refresh is tried again later.
  */
 export async function refreshAccessToken(
   token: JWT & SubriteJWT,
@@ -229,66 +270,244 @@ export async function refreshAccessToken(
   }
 }
 
+/**
+ * Asks Subrite to revoke the refresh token, for example when the user signs out of the app.
+ * Refresh tokens for offline access keep working after the user signs out of Subrite, so revoke
+ * them yourself. Requests with an old cookie that holds this token are not answered from memory
+ * afterwards.
+ *
+ * Never throws. Returns true when Subrite confirmed the revocation.
+ */
+export async function revokeRefreshToken(
+  token: Partial<Pick<SubriteJWT, 'refreshToken'>>,
+  params: RefreshParams,
+): Promise<boolean> {
+  const { refreshToken } = token;
+  if (typeof refreshToken !== 'string' || !refreshToken) {
+    return false;
+  }
+  forgetRefreshToken(refreshToken, params);
+  try {
+    const signal = AbortSignal.timeout(params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const discovery = await discover(params, signal);
+    const endpoint = readString(discovery, 'revocation_endpoint');
+    if (!endpoint) {
+      console.error('Error revoking refresh token: Subrite has no revocation_endpoint');
+      return false;
+    }
+    const request = authenticatedForm(discovery, params);
+    if (!request) {
+      return false;
+    }
+    request.form.append('token', refreshToken);
+    request.form.append('token_type_hint', 'refresh_token');
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: request.headers,
+      body: request.form,
+      signal,
+      redirect: 'manual',
+    });
+    if (!response.ok) {
+      const body: unknown = await response.json().catch(() => undefined);
+      console.error('Error revoking refresh token:', {
+        status: response.status,
+        error: readString(body, 'error'),
+        error_description: readString(body, 'error_description'),
+      });
+      return false;
+    }
+    await response.body?.cancel();
+    return true;
+  } catch (error) {
+    console.error('Error revoking refresh token:', describeError(error));
+    return false;
+  }
+}
+
 function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<RefreshOutcome> {
   const now = Date.now();
   pruneRefreshes(now);
-  // One app can talk to several Subrite servers or clients. Never share results between them.
-  const key = JSON.stringify([String(params.subriteUrl), params.clientId, refreshToken]);
-  const existing = refreshes.get(key);
+  const clientKey = clientKeyOf(params);
+  const key = refreshKeyOf(params, refreshToken);
+  const existing = state.refreshes.get(key);
   if (existing && existing.reuseUntil > now) {
+    warnOnLateReuse(existing, now);
     return existing.outcome;
   }
+
+  const health = state.clients.get(clientKey);
+  if (health && (health.pausedUntil > now || health.probing)) {
+    // Subrite is having trouble. Keep the token and don't add to the load.
+    return Promise.resolve(TEMPORARY);
+  }
+  if (health && health.failures > 0) {
+    // This request checks whether Subrite is back. Other requests wait for its answer.
+    health.probing = true;
+  }
+
   const entry: RefreshEntry = {
     outcome: requestRefresh(refreshToken, params),
-    // Keep the entry while the request is in progress. Set the real deadlines once it finishes.
+    sentRefreshToken: refreshToken,
+    // Keep the entry while the request is in progress. Set the real deadline once it finishes.
     reuseUntil: Number.POSITIVE_INFINITY,
-    keepUntil: Number.POSITIVE_INFINITY,
-    failures: existing?.failures ?? 0,
   };
   // Delete first, so the Map's insertion order stays oldest first for pruning.
-  refreshes.delete(key);
-  refreshes.set(key, entry);
-  entry.outcome.then((outcome) => settle(entry, outcome));
+  state.refreshes.delete(key);
+  state.refreshes.set(key, entry);
+  entry.outcome.then((outcome) => settle(entry, clientKey, outcome, params));
   return entry.outcome;
 }
 
-function settle(entry: RefreshEntry, outcome: RefreshOutcome): void {
+function settle(
+  entry: RefreshEntry,
+  clientKey: string,
+  outcome: RefreshOutcome,
+  params: RefreshParams,
+): void {
   const now = Date.now();
+  // Revoked while the request was in progress: the revocation wins.
+  const revoked = entry.settled !== undefined;
+  if (!revoked) {
+    entry.settled = outcome;
+    entry.settledAt = now;
+  }
+  const health = state.clients.get(clientKey) ?? {
+    failures: 0,
+    lastFailure: 0,
+    pausedUntil: 0,
+    probing: false,
+  };
+  state.clients.set(clientKey, health);
+  health.probing = false;
+  if (revoked && outcome.kind !== 'temporary-failure') {
+    health.failures = 0;
+    health.pausedUntil = 0;
+    return;
+  }
+
   switch (outcome.kind) {
     case 'success': {
-      const nearExpiry = outcome.accessTokenExpires - DEFAULT_EXPIRY_MARGIN_SECONDS * 1000;
-      entry.failures = 0;
-      entry.reuseUntil = Math.max(now + MIN_SUCCESS_REUSE_MS, nearExpiry);
-      entry.keepUntil = entry.reuseUntil;
+      health.failures = 0;
+      health.pausedUntil = 0;
+      if (outcome.refreshToken === entry.sentRefreshToken) {
+        // Subrite kept the refresh token, so sending it again is fine. Only share the result
+        // with requests that arrive together, and never past the access token's expiry.
+        entry.reuseUntil = Math.min(now + MIN_SUCCESS_REUSE_MS, outcome.accessTokenExpires);
+      } else if (params.oldCookieGraceSeconds !== undefined) {
+        // At least long enough for requests that arrive together to share the refresh.
+        const grace = Math.max(params.oldCookieGraceSeconds * 1000, MIN_SUCCESS_REUSE_MS);
+        entry.reuseUntil = now + grace;
+      } else {
+        // Subrite replaced the refresh token. Sending the old one again would be a reuse, which
+        // Subrite may answer by revoking the whole sign in. Answer old cookies from memory.
+        const nearExpiry = outcome.accessTokenExpires - DEFAULT_EXPIRY_MARGIN_SECONDS * 1000;
+        entry.reuseUntil = Math.max(now + MIN_SUCCESS_REUSE_MS, nearExpiry);
+      }
       return;
     }
     case 'permanent-failure':
+      // Subrite answered, so it is up.
+      health.failures = 0;
+      health.pausedUntil = 0;
       entry.reuseUntil = now + PERMANENT_FAILURE_REUSE_MS;
-      entry.keepUntil = entry.reuseUntil;
       return;
-    case 'temporary-failure':
-      entry.failures += 1;
-      entry.reuseUntil = now + Math.min(BACKOFF_MS * 2 ** (entry.failures - 1), MAX_BACKOFF_MS);
-      entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
+    case 'temporary-failure': {
+      if (now - health.lastFailure > FAILURE_MEMORY_MS) {
+        health.failures = 0;
+      }
+      health.failures += 1;
+      health.lastFailure = now;
+      const backoff = outcome.retryAfterMs ?? BACKOFF_MS * 2 ** Math.min(health.failures - 1, 10);
+      health.pausedUntil = now + Math.min(Math.max(backoff, BACKOFF_MS), MAX_BACKOFF_MS);
+      // Nothing worth reusing. The pause decides when to try again.
+      if (!revoked) entry.reuseUntil = now;
       return;
+    }
+  }
+}
+
+// An old cookie answered from memory long after its refresh is normal for App Router Server
+// Components, which can't save cookies. It can also be a copied session cookie. Log it once.
+function warnOnLateReuse(entry: RefreshEntry, now: number): void {
+  const { settled, settledAt } = entry;
+  if (
+    entry.warned ||
+    settled?.kind !== 'success' ||
+    settledAt === undefined ||
+    settled.refreshToken === entry.sentRefreshToken ||
+    now - settledAt <= MIN_SUCCESS_REUSE_MS
+  ) {
+    return;
+  }
+  entry.warned = true;
+  console.warn(
+    `Subrite: a request used a refresh token that was replaced ${Math.round((now - settledAt) / 1000)} s ` +
+      'ago and got the new tokens from memory. This is expected when Server Components refresh ' +
+      'the session. See "Where a refreshed token is saved" in the README.',
+  );
+}
+
+// One app can talk to several Subrite servers or clients. Never share results between them.
+function clientKeyOf(params: RefreshParams): string {
+  return JSON.stringify([String(params.subriteUrl), params.clientId]);
+}
+
+function refreshKeyOf(params: RefreshParams, refreshToken: string): string {
+  return JSON.stringify([String(params.subriteUrl), params.clientId, refreshToken]);
+}
+
+// After a revocation, neither this refresh token nor old cookies that it replaced may get
+// tokens from memory, and this refresh token is not sent to Subrite again.
+function forgetRefreshToken(refreshToken: string, params: RefreshParams): void {
+  const prefix = clientKeyOf(params).slice(0, -1);
+  const now = Date.now();
+  const revoked = (sentRefreshToken: string): RefreshEntry => ({
+    outcome: Promise.resolve(PERMANENT),
+    settled: PERMANENT,
+    settledAt: now,
+    sentRefreshToken,
+    reuseUntil: now + PERMANENT_FAILURE_REUSE_MS,
+  });
+  for (const [key, entry] of state.refreshes) {
+    if (!key.startsWith(prefix)) continue;
+    const replacedBy = entry.settled?.kind === 'success' ? entry.settled.refreshToken : undefined;
+    if (replacedBy === refreshToken) {
+      state.refreshes.set(key, revoked(entry.sentRefreshToken));
+    }
+  }
+  const key = refreshKeyOf(params, refreshToken);
+  const current = state.refreshes.get(key);
+  if (current && !current.settled) {
+    // Revoked while a refresh is in progress: settle() keeps the revocation.
+    current.outcome = Promise.resolve(PERMANENT);
+    current.settled = PERMANENT;
+    current.settledAt = now;
+    current.reuseUntil = now + PERMANENT_FAILURE_REUSE_MS;
+  } else {
+    state.refreshes.delete(key);
+    state.refreshes.set(key, revoked(refreshToken));
   }
 }
 
 function pruneRefreshes(now: number): void {
-  if (now - lastPrune >= PRUNE_INTERVAL_MS) {
-    lastPrune = now;
+  const { refreshes } = state;
+  // Also prune when the clock went backwards.
+  if (now < state.lastPrune || now - state.lastPrune >= PRUNE_INTERVAL_MS) {
+    state.lastPrune = now;
     for (const [key, entry] of refreshes) {
-      if (entry.keepUntil <= now) {
+      if (entry.settled && entry.reuseUntil <= now) {
         refreshes.delete(key);
       }
     }
   }
-  // The Map keeps insertion order, so the first entries are the oldest.
-  for (const key of refreshes.keys()) {
-    if (refreshes.size <= MAX_REFRESH_ENTRIES) {
-      break;
+  // Make room for one more. The Map keeps insertion order, so the first entries are the oldest.
+  // Never drop a refresh that is still in progress: its refresh token would be sent twice.
+  if (refreshes.size >= MAX_REFRESH_ENTRIES) {
+    for (const [key, entry] of refreshes) {
+      if (refreshes.size < MAX_REFRESH_ENTRIES) break;
+      if (entry.settled) refreshes.delete(key);
     }
-    refreshes.delete(key);
   }
 }
 
@@ -300,7 +519,7 @@ async function requestRefresh(
     return await callTokenEndpoint(refreshToken, params);
   } catch (error) {
     console.error('Error refreshing access token:', describeError(error));
-    return { kind: 'temporary-failure' };
+    return TEMPORARY;
   }
 }
 
@@ -308,46 +527,33 @@ async function callTokenEndpoint(
   refreshToken: string,
   params: RefreshParams,
 ): Promise<RefreshOutcome> {
-  const { subriteUrl, clientId, clientSecret, timeoutMs = DEFAULT_TIMEOUT_MS } = params;
-
   let response: Response;
   try {
-    const signal = AbortSignal.timeout(timeoutMs);
-    const discovery = await discover(subriteUrl, signal);
-
-    const authMethod = params.client?.token_endpoint_auth_method ?? defaultAuthMethod(discovery);
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Accept: 'application/json',
-    };
-    const form = new URLSearchParams();
-    form.append('grant_type', 'refresh_token');
-    form.append('refresh_token', refreshToken);
-    if (authMethod === 'client_secret_basic') {
-      headers.Authorization = basicAuth(clientId, clientSecret);
-    } else if (authMethod === 'client_secret_post') {
-      form.append('client_id', clientId);
-      form.append('client_secret', clientSecret);
-    } else {
-      console.error(
-        `Error refreshing access token: token_endpoint_auth_method ${authMethod} is not supported`,
-      );
-      return { kind: 'permanent-failure' };
+    const signal = AbortSignal.timeout(params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const discovery = await discover(params, signal);
+    const request = authenticatedForm(discovery, params);
+    if (!request) {
+      // A configuration problem. Keep the sessions until it is fixed.
+      return TEMPORARY;
     }
+    request.form.append('grant_type', 'refresh_token');
+    request.form.append('refresh_token', refreshToken);
 
     // Never follow a redirect: it would send the refresh token (and maybe the client secret) to
-    // another address. openid-client refuses redirects on sign in too.
+    // another address. openid-client refuses redirects on sign in too. 'manual' returns the 3xx
+    // as it is, which counts as a temporary failure below. ('error' is not supported everywhere,
+    // for example not on Cloudflare Workers.)
     response = await fetch(discovery.token_endpoint, {
       method: 'POST',
-      headers,
-      body: form,
+      headers: request.headers,
+      body: request.form,
       signal,
-      redirect: 'error',
+      redirect: 'manual',
     });
   } catch (error) {
-    // Network error, timeout, redirect or failed discovery. Worth trying again later.
+    // Network error, timeout or failed discovery. Worth trying again later.
     console.error('Error refreshing access token:', describeError(error));
-    return { kind: 'temporary-failure' };
+    return TEMPORARY;
   }
 
   let body: unknown;
@@ -361,7 +567,7 @@ async function callTokenEndpoint(
         'Error refreshing access token: could not read the token response:',
         describeError(error),
       );
-      return { kind: 'temporary-failure' };
+      return TEMPORARY;
     }
     body = undefined;
   }
@@ -374,15 +580,20 @@ async function callTokenEndpoint(
       error,
       error_description: readString(body, 'error_description'),
     });
-    if (error === 'invalid_client') {
+    if (isRejection(response.status, error)) {
+      return PERMANENT;
+    }
+    if (error && response.status >= 400 && response.status < 500) {
       console.error(
-        'Subrite did not accept the client id or secret. Check the configuration. Sessions are ' +
-          'kept and refreshed again once it is fixed.',
+        `Subrite answered ${error}, which points to the client configuration (client id, ` +
+          'secret, or allowed grants). Sessions are kept and refreshed once it is fixed.',
       );
     }
-    return {
-      kind: isRejection(response.status, error) ? 'permanent-failure' : 'temporary-failure',
-    };
+    if (response.status >= 300 && response.status < 400) {
+      console.error('Subrite redirected the token request. The redirect was not followed.');
+    }
+    const retryAfterMs = readRetryAfter(response);
+    return retryAfterMs === undefined ? TEMPORARY : { kind: 'temporary-failure', retryAfterMs };
   }
 
   const accessToken = readString(body, 'access_token');
@@ -391,7 +602,7 @@ async function callTokenEndpoint(
     console.error('Error refreshing access token: the token response has no access_token', {
       status: response.status,
     });
-    return { kind: 'permanent-failure' };
+    return PERMANENT;
   }
   let expiresIn = readExpiresIn(body);
   if (expiresIn === undefined) {
@@ -412,19 +623,55 @@ async function callTokenEndpoint(
   };
 }
 
-// Only a client error that Subrite explains with an OAuth error code (RFC 6749 section 5.2), such
-// as invalid_grant, means the refresh token is rejected. invalid_client is a configuration
-// problem and says nothing about the user's token. A client error without an error code comes
-// from something in between, like a firewall, CDN or load balancer.
+// RFC 6749 section 5.2: invalid_grant means the refresh token is invalid, expired or revoked.
+// Every other error code is about the client, the request or the server (invalid_client,
+// unauthorized_client, invalid_request, unsupported_grant_type), and says nothing about the
+// user's token. A client error without a code comes from something in between, like a firewall.
 function isRejection(status: number, error: string | undefined): boolean {
-  if (status < 400 || status >= 500 || status === 408 || status === 425 || status === 429) {
-    return false;
+  return status >= 400 && status < 500 && error === 'invalid_grant';
+}
+
+// Retry-After is either a number of seconds or an HTTP date (RFC 9110 section 10.2.3).
+function readRetryAfter(response: Response): number | undefined {
+  const value = response.headers.get('retry-after')?.trim();
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+type AuthenticatedForm = { headers: Record<string, string>; form: URLSearchParams };
+
+// Same choice as openid-client, which NextAuth uses for the sign in: HTTP Basic unless Subrite
+// says it only supports client_secret_post. The config can choose explicitly.
+function authenticatedForm(
+  discovery: Discovery,
+  params: RefreshParams,
+): AuthenticatedForm | undefined {
+  const method = params.client?.token_endpoint_auth_method ?? defaultAuthMethod(discovery);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Accept: 'application/json',
+  };
+  const form = new URLSearchParams();
+  if (method === 'client_secret_basic') {
+    headers.Authorization = basicAuth(params.clientId, params.clientSecret);
+  } else if (method === 'client_secret_post') {
+    form.append('client_id', params.clientId);
+    form.append('client_secret', params.clientSecret);
+  } else {
+    console.error(
+      `Subrite: token_endpoint_auth_method ${method} is not supported. Use client_secret_basic ` +
+        'or client_secret_post.',
+    );
+    return undefined;
   }
-  return error !== undefined && error !== 'invalid_client';
+  return { headers, form };
 }
 
 type Discovery = {
   token_endpoint: string;
+  revocation_endpoint?: unknown;
   token_endpoint_auth_methods_supported?: unknown;
 };
 
@@ -433,16 +680,20 @@ const discoveryCache = processWide(
   () => new Map<string, { document: Promise<Discovery>; expires: number }>(),
 );
 
-function discover(subriteUrl: string | URL, signal: AbortSignal): Promise<Discovery> {
-  const url = subriteEndpoint(subriteUrl, WELL_KNOWN_PATH);
+// Fetches Subrite's OpenID configuration once and shares it. The shared request has its own
+// timeout, so one caller giving up early doesn't fail the others. Each caller waits only as
+// long as its own signal allows.
+function discover(params: RefreshParams, signal: AbortSignal): Promise<Discovery> {
+  const url = subriteEndpoint(params.subriteUrl, WELL_KNOWN_PATH);
   const cached = discoveryCache.get(url);
   if (cached && cached.expires > Date.now()) {
-    return cached.document;
+    return untilAborted(cached.document, signal);
   }
+  const timeoutMs = Math.max(params.timeoutMs ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
   const document = fetch(url, {
     headers: { Accept: 'application/json' },
-    signal,
-    redirect: 'error',
+    signal: AbortSignal.timeout(timeoutMs),
+    redirect: 'manual',
   }).then(async (response) => {
     if (!response.ok) {
       throw new Error(`OpenID configuration request failed with status ${response.status}`);
@@ -460,11 +711,20 @@ function discover(subriteUrl: string | URL, signal: AbortSignal): Promise<Discov
       discoveryCache.delete(url);
     }
   });
-  return document;
+  return untilAborted(document, signal);
 }
 
-// Same choice as openid-client, which NextAuth uses for the sign in: HTTP Basic unless Subrite
-// says it only supports client_secret_post.
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
 function defaultAuthMethod(discovery: Discovery): string {
   const supported = discovery.token_endpoint_auth_methods_supported;
   if (
@@ -497,11 +757,19 @@ function readExpiresIn(body: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+// Includes the cause (like ECONNREFUSED or a certificate error), which fetch puts there.
+// Neither the message nor the cause ever holds a token.
 function describeError(error: unknown): string {
-  if (error instanceof Error) {
-    return `${error.name}: ${error.message}`;
+  if (!(error instanceof Error)) {
+    return String(error);
   }
-  return String(error);
+  const text = `${error.name}: ${error.message}`;
+  const cause = error.cause;
+  if (cause instanceof Error) {
+    const code = (cause as Error & { code?: unknown }).code;
+    return `${text} (${typeof code === 'string' ? code : cause.name}: ${cause.message})`;
+  }
+  return text;
 }
 
 /** The URL that signs the user out of Subrite and then sends them to `postLogoutRedirectUri`. */

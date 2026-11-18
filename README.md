@@ -150,6 +150,7 @@ import type { NextAuthOptions } from 'next-auth';
 import Subrite, {
   isAccessTokenExpired,
   refreshAccessToken,
+  revokeRefreshToken,
   toSubriteJWT,
 } from '@subrite/next-auth-provider';
 
@@ -161,6 +162,12 @@ const subriteConfig = {
 
 export const options: NextAuthOptions = {
   providers: [Subrite(subriteConfig)],
+  events: {
+    // The refresh token keeps working after the user signs out of Subrite, so revoke it.
+    async signOut({ token }) {
+      await revokeRefreshToken(token, subriteConfig);
+    },
+  },
   callbacks: {
     async jwt({ token, account }) {
       if (account) {
@@ -191,6 +198,8 @@ export const options: NextAuthOptions = {
 ```
 
 The ID token is validated on sign in, and the user's name, email and picture are read from it.
+
+Subrite must give the app a refresh token without asking the user for consent each time. If your Subrite server only does that with `prompt=consent`, add `authorization: { params: { prompt: 'consent' } }` to `subriteConfig`.
 
 If your application is registered with `client_secret_post` instead of the default HTTP Basic authentication, add it to the config.
 `satisfies` keeps the exact type that NextAuth expects:
@@ -230,7 +239,7 @@ declare module 'next-auth/jwt' {
 
 ### When the user must sign in again
 
-`refreshAccessToken` never throws. If Subrite rejects the refresh token (for example because it expired or was revoked), the token gets `error: 'RefreshAccessTokenError'` and the rejected refresh token is removed.
+`refreshAccessToken` never throws. If Subrite rejects the refresh token with `invalid_grant` (because it expired or was revoked), the token gets `error: 'RefreshAccessTokenError'` and the rejected refresh token is removed.
 From then on `refreshAccessToken` returns it as is, without calling Subrite. Send the user through sign in again:
 
 ```tsx
@@ -254,8 +263,9 @@ export function SubriteSessionGuard() {
 
 On the server, check `session.error` (from `getServerSession`) or `token.error` (from `getToken`) the same way.
 
-Other failures don't sign anyone out. If Subrite can't be reached, times out, or answers with a 5xx, a 429, or an error that isn't an OAuth rejection of the token (such as a firewall page or `invalid_client` while a client secret is being fixed), the token is left as is (still expired).
-The refresh is tried again after 10 seconds, then after 20, 40 and so on, up to every 5 minutes.
+Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
+Refreshes for that Subrite client then pause for 10 seconds, or as long as Subrite's `Retry-After` header says. After the pause one request checks whether Subrite is back, while the others keep their tokens. Each failure in a row doubles the pause, up to 5 minutes.
+Configuration problems are logged with a hint, and sessions recover on their own once the configuration is fixed.
 
 ### Where a refreshed token is saved
 
@@ -264,12 +274,27 @@ The `jwt` callback refreshes the token wherever NextAuth reads the session. The 
 - the NextAuth route `/api/auth/session`, which `useSession` and `SessionProvider` call in the browser
 - `getServerSession(req, res, options)` in the Pages Router
 
-In the App Router, `getServerSession(options)` in Server Components, Route Handlers and Server Actions refreshes the token but cannot save it.
-The browser keeps the old cookie with the old refresh token.
-Within one server process, later requests with that old cookie get the new tokens from memory instead of sending the old refresh token again, until the new access token is about to expire.
+In the App Router, `getServerSession(options)` in Server Components, Route Handlers and Server Actions refreshes the token but cannot save it. The browser keeps the old cookie.
 
-So in App Router apps, wrap the app in `SessionProvider`. The browser then calls `/api/auth/session` after a page loads, and that saves the refreshed cookie.
-An app that only renders on the server, without `SessionProvider`, sends an already used refresh token once the new access token expires too. If Subrite rotates refresh tokens, that user must sign in again.
+That matters when Subrite replaces the refresh token on refresh (rotation). Sending the old one again is a reuse, and Subrite may answer by revoking the whole sign in.
+So within one server process, a request with an old cookie gets the new tokens from memory instead, until the new access token is about to expire. The first time that happens more than 30 seconds after the refresh, it is logged as a warning.
+When Subrite keeps the refresh token, nothing is reused for longer than 30 seconds, so a forced refresh or a revocation reaches Subrite.
+
+In App Router apps, make sure the browser saves the refreshed cookie soon:
+
+```tsx
+<SessionProvider refetchInterval={5 * 60}>{children}</SessionProvider>
+```
+
+`SessionProvider` calls `/api/auth/session` when it mounts, when the window gets focus, and every `refetchInterval` seconds. It does not call it on client side navigation, and it skips the call on mount when you pass it a `session` prop. Keep `refetchInterval` well below the access token lifetime minus one minute.
+
+An app that only renders on the server, without `SessionProvider`, sends an already used refresh token once the new access token expires. If Subrite rotates refresh tokens, that user must sign in again.
+
+Answering old cookies from memory also means a copied session cookie gets new tokens without Subrite noticing the reuse. If your app always saves refreshed cookies right away (Pages Router, or no Server Components that read the session), make the window short:
+
+```typescript
+refreshAccessToken(token, { ...subriteConfig, oldCookieGraceSeconds: 30 });
+```
 
 ### Keeping the access token on the server
 
@@ -285,6 +310,11 @@ The refresh token is never put in the session.
 Within one server process, every request that holds the same refresh token shares one refresh, also across the separate copies of the library that Next.js loads for the Pages Router and the App Router.
 Different servers and serverless instances don't share memory. Two of them can refresh the same session at the same moment, or an old cookie can reach an instance that hasn't seen the refresh.
 If Subrite rotates refresh tokens and rejects a reused one, that user must sign in again.
+
+### Signing out
+
+`revokeRefreshToken(token, subriteConfig)` revokes the refresh token at Subrite. The configuration above calls it from `events.signOut`.
+It never throws, and returns `true` when Subrite confirmed the revocation. Afterwards, requests with an old cookie that holds the token are not answered from memory any more.
 
 ## Refreshing the access token
 

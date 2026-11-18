@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import Subrite, {
   generatePostSignOutUrl,
   isAccessTokenExpired,
@@ -165,14 +165,16 @@ describe('refreshAccessToken', () => {
     assert.equal(request.form.get('client_secret'), 's3cret:+');
   });
 
-  it('flags an unsupported token_endpoint_auth_method without calling Subrite', async () => {
+  it('keeps the session when token_endpoint_auth_method is not supported', async () => {
     const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
-    const refreshed = await refreshAccessToken(sessionToken(), {
+    const token = sessionToken();
+    const refreshed = await refreshAccessToken(token, {
       ...subrite.params,
       client: { token_endpoint_auth_method: 'private_key_jwt' },
     });
-    assert.equal(refreshed.error, 'RefreshAccessTokenError');
+    assert.deepEqual(refreshed, token, 'a configuration problem never signs users out');
     assert.equal(subrite.calls.token.length, 0);
+    assert.match(loggedText(), /private_key_jwt is not supported/);
   });
 
   it('keeps the old refresh token when Subrite does not send a new one', async () => {
@@ -333,12 +335,15 @@ describe('refreshAccessToken', () => {
   });
 
   it('does not cache a failed OpenID configuration request', async () => {
+    mock.timers.enable({ apis: ['Date'], now: Date.now() });
     const subrite = fakeSubrite({
       discoveryStatus: 500,
       token: () => ok({ access_token: 'a', expires_in: 60 }),
     });
     const token = sessionToken();
     assert.deepEqual(await refreshAccessToken(token, subrite.params), token);
+    // Refreshes pause for 10 s after a failure. Then the next one fetches the configuration again.
+    mock.timers.tick(10_000);
     await refreshAccessToken(sessionToken(), subrite.params);
     assert.equal(subrite.calls.discovery, 2);
     assert.equal(subrite.calls.token.length, 0);
