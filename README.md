@@ -14,6 +14,8 @@ Subrite Auth will redirect the user after they have logged in.
 
 Once you have registered your application, you will be given a `CLIENT_ID` and a `CLIENT_SECRET`. You will also be given a `SUBRITE_URL`, which is the URL of the Subrite server you will be using.
 
+Your application must be allowed to use refresh tokens (the `offline_access` scope). The NextAuth provider below needs them.
+
 ## Creating a login link
 
 To log in a user, you must first create a login link.
@@ -47,25 +49,48 @@ The following JavaScript code illustrates how to construct a logout URL for Subr
 
 ```typescript
 // Construct a URL object for the Subrite sign out endpoint.
-const subriteSignoutUrl = new URL('/api/oidc/session/end', subriteUrl);
+// The trailing slash keeps any path that SUBRITE_URL has.
+const base = subriteUrl.endsWith('/') ? subriteUrl : `${subriteUrl}/`;
+const subriteSignoutUrl = new URL('api/oidc/session/end', base);
 // Tell subrite what client we are signing out from
 subriteSignoutUrl.searchParams.append('client_id', clientId);
 // Tell subrite where to send the user agent after signing out (where we sign out from the application)
 const postLogoutRedirectUri = new URL('/logout', process.env.NEXT_PUBLIC_NEXTAUTH_URL!).href;
 subriteSignoutUrl.searchParams.append('post_logout_redirect_uri', postLogoutRedirectUri);
+// A random value that Subrite sends back to the logout page. See below.
+subriteSignoutUrl.searchParams.append('state', state);
 ```
 
-With `@subrite/next-auth-provider` you can use `generatePostSignOutUrl(subriteUrl, clientId, postLogoutRedirectUri)` instead.
+With `@subrite/next-auth-provider` you can use `generatePostSignOutUrl(subriteUrl, clientId, postLogoutRedirectUri, { state })` instead.
 
 The `postLogoutRedirectUri` must be one of the `post_logout_redirect_uri` values configured for your application in Subrite.
 
-```tsx
-<!-- This link initiates the sign out flow -->
-<a href={subriteSignoutUrl.href}>Sign Out</a>
-```
-
 The `/logout` page where the browser is redirected to should clear the user's application session.
-Below is an example that uses NextAuth.js:
+It should only do that without asking when the sign out started on your site. Otherwise any other site could sign your users out by linking to `/logout`.
+The `state` value makes that check possible. Below is an example that uses NextAuth.js:
+
+```tsx
+'use client';
+
+import { generatePostSignOutUrl } from '@subrite/next-auth-provider';
+
+export const SIGN_OUT_STATE_KEY = 'subrite-sign-out-state';
+
+export function SignOutButton() {
+  function signOutOfSubrite() {
+    const state = crypto.randomUUID();
+    sessionStorage.setItem(SIGN_OUT_STATE_KEY, state);
+    window.location.href = generatePostSignOutUrl(
+      process.env.NEXT_PUBLIC_SUBRITE_URL!,
+      process.env.NEXT_PUBLIC_SUBRITE_CLIENT_ID!,
+      new URL('/logout', window.location.origin).href,
+      { state },
+    );
+  }
+
+  return <button onClick={signOutOfSubrite}>Sign out</button>;
+}
+```
 
 ```tsx
 'use client';
@@ -73,26 +98,38 @@ Below is an example that uses NextAuth.js:
 import { signOut, useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import { SIGN_OUT_STATE_KEY } from './sign-out-button';
 
 export default function LogoutPage() {
-  const [error, setError] = useState<string>('');
+  const [error, setError] = useState('');
+  const [askFirst, setAskFirst] = useState(false);
   const { status } = useSession();
   const router = useRouter();
 
   useEffect(() => {
     // Wait until NextAuth knows whether the user is signed in.
     if (status === 'loading') return;
+    if (status !== 'authenticated') {
+      router.push('/');
+      return;
+    }
 
-    if (status === 'authenticated') {
+    const state = new URLSearchParams(window.location.search).get('state');
+    if (state && state === sessionStorage.getItem(SIGN_OUT_STATE_KEY)) {
       signOut({ callbackUrl: '/' }).catch((err) => setError(err.message));
     } else {
-      router.push('/');
+      // The sign out did not start here. Let the user decide.
+      setAskFirst(true);
     }
   }, [status, router]);
 
-  return <>{error ? <p>{error}</p> : <p>Signing out...</p>}</>;
+  if (error) return <p>{error}</p>;
+  if (askFirst) return <button onClick={() => signOut({ callbackUrl: '/' })}>Sign out</button>;
+  return <p>Signing out...</p>;
 }
 ```
+
+Signing out of Subrite does not end the app sessions that use it: refresh tokens for offline access keep working after it. That is why the app must clear its own session.
 
 ## NextAuth.js
 
@@ -155,6 +192,20 @@ export const options: NextAuthOptions = {
 
 The ID token is validated on sign in, and the user's name, email and picture are read from it.
 
+If your application is registered with `client_secret_post` instead of the default HTTP Basic authentication, add it to the config.
+`satisfies` keeps the exact type that NextAuth expects:
+
+```typescript
+import type { SubriteConfig } from '@subrite/next-auth-provider';
+
+const subriteConfig = {
+  clientId: 'your-client-id',
+  clientSecret: 'your-client-secret',
+  subriteUrl: 'your-subrite-url',
+  client: { token_endpoint_auth_method: 'client_secret_post' },
+} satisfies SubriteConfig;
+```
+
 ### TypeScript Configuration
 
 (You can skip this step if you are not using TypeScript)
@@ -179,7 +230,7 @@ declare module 'next-auth/jwt' {
 
 ### When the user must sign in again
 
-`refreshAccessToken` never throws. If Subrite rejects the refresh token (for example because the user signed out from Subrite, or the session expired), the token gets `error: 'RefreshAccessTokenError'`.
+`refreshAccessToken` never throws. If Subrite rejects the refresh token (for example because it expired or was revoked), the token gets `error: 'RefreshAccessTokenError'` and the rejected refresh token is removed.
 From then on `refreshAccessToken` returns it as is, without calling Subrite. Send the user through sign in again:
 
 ```tsx
@@ -201,21 +252,39 @@ export function SubriteSessionGuard() {
 }
 ```
 
-On the server, check `token.error` (from `getToken`) or `session.error` (from `getServerSession`) the same way.
+On the server, check `session.error` (from `getServerSession`) or `token.error` (from `getToken`) the same way.
 
-If Subrite can't be reached, or answers with a 5xx or 429, the token is left as is (still expired) and the refresh is tried again after 10 seconds.
+Other failures don't sign anyone out. If Subrite can't be reached, times out, or answers with a 5xx, a 429, or an error that isn't an OAuth rejection of the token (such as a firewall page or `invalid_client` while a client secret is being fixed), the token is left as is (still expired).
+The refresh is tried again after 10 seconds, then after 20, 40 and so on, up to every 5 minutes.
+
+### Where a refreshed token is saved
+
+The `jwt` callback refreshes the token wherever NextAuth reads the session. The new token is only saved where NextAuth can write the session cookie:
+
+- the NextAuth route `/api/auth/session`, which `useSession` and `SessionProvider` call in the browser
+- `getServerSession(req, res, options)` in the Pages Router
+
+In the App Router, `getServerSession(options)` in Server Components, Route Handlers and Server Actions refreshes the token but cannot save it.
+The browser keeps the old cookie with the old refresh token.
+Within one server process, later requests with that old cookie get the new tokens from memory instead of sending the old refresh token again, until the new access token is about to expire.
+
+So in App Router apps, wrap the app in `SessionProvider`. The browser then calls `/api/auth/session` after a page loads, and that saves the refreshed cookie.
+An app that only renders on the server, without `SessionProvider`, sends an already used refresh token once the new access token expires too. If Subrite rotates refresh tokens, that user must sign in again.
 
 ### Keeping the access token on the server
 
 The example `session` callback puts the access token in the session, which makes it readable by JavaScript in the browser.
 Only do that if browser code calls Subrite directly. Otherwise leave it out, and read the token on the server with `getToken` from `next-auth/jwt`.
+
+`getToken` returns the token as the cookie stores it. It never refreshes, so check `isAccessTokenExpired(token)` before you use `token.accessToken`.
+If it has expired, answer with a 401 and let the browser call `getSession()` (which refreshes and saves the cookie) and try again.
 The refresh token is never put in the session.
 
 ### Running on several servers
 
-Within one server process, parallel requests share a single refresh, so a refresh token is never sent twice.
-If your app runs on several servers or serverless instances, two of them can still refresh the same session at the same moment.
-If Subrite rotates refresh tokens, the second refresh is rejected and that user has to sign in again.
+Within one server process, every request that holds the same refresh token shares one refresh, also across the separate copies of the library that Next.js loads for the Pages Router and the App Router.
+Different servers and serverless instances don't share memory. Two of them can refresh the same session at the same moment, or an old cookie can reach an instance that hasn't seen the refresh.
+If Subrite rotates refresh tokens and rejects a reused one, that user must sign in again.
 
 ## Refreshing the access token
 
@@ -246,9 +315,11 @@ Response:
 {
   "access_token": "{NEW_ACCESS_TOKEN}",
   "refresh_token": "{NEW_REFRESH_TOKEN}",
-  "expires_in": {SECONDS_UNTIL_EXPIRATION},
+  "expires_in": 3600
 }
 ```
+
+`expires_in` is the number of seconds until the access token expires.
 
 Always store the new refresh token. Once it is used, the old one may no longer work.
 

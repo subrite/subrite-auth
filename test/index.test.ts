@@ -203,16 +203,38 @@ describe('refreshAccessToken', () => {
     assert.equal(subrite.calls.token.length, 1);
   });
 
-  it('never logs tokens from an unexpected token response', async () => {
+  it('keeps new tokens without expires_in, assumes 5 minutes, and logs no tokens', async () => {
     const subrite = fakeSubrite({
       token: () => ok({ access_token: 'secret-access', refresh_token: 'secret-refresh' }),
     });
     const token = sessionToken();
+    const before = Date.now();
     const refreshed = await refreshAccessToken(token, subrite.params);
-    assert.equal(refreshed.error, 'RefreshAccessTokenError');
-    assert.notEqual(loggedText(), '');
+    assert.equal(refreshed.accessToken, 'secret-access');
+    assert.equal(refreshed.refreshToken, 'secret-refresh');
+    assert.ok(refreshed.accessTokenExpires >= before + 300_000);
+    assert.ok(refreshed.accessTokenExpires <= Date.now() + 300_000);
+    assert.match(loggedText(), /expires_in/);
     assert.doesNotMatch(loggedText(), /secret-access|secret-refresh/);
     assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
+  });
+
+  it('flags a token response without an access token, and logs no tokens', async () => {
+    const subrite = fakeSubrite({
+      token: () => ok({ refresh_token: 'secret-refresh', expires_in: 60 }),
+    });
+    const token = sessionToken();
+    const refreshed = await refreshAccessToken(token, subrite.params);
+    assert.equal(refreshed.error, 'RefreshAccessTokenError');
+    assert.doesNotMatch(loggedText(), /secret-refresh/);
+    assert.doesNotMatch(loggedText(), new RegExp(token.refreshToken));
+  });
+
+  it('accepts expires_in as a numeric string', async () => {
+    const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: '3600' }) });
+    const before = Date.now();
+    const refreshed = await refreshAccessToken(sessionToken(), subrite.params);
+    assert.ok(refreshed.accessTokenExpires >= before + 3_600_000);
   });
 
   it('leaves the token alone on a temporary failure and backs off', async () => {

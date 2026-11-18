@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Requires `next-auth` 4.24.15 or later. Older versions have known security issues.
 - The provider no longer puts the tokens on the NextAuth `User`. Read them from `account` in the
   `jwt` callback with `toSubriteJWT` (as the README shows). This stops stale copies of the tokens
-  piling up in the session cookie.
+  piling up in the session cookie. Apps that keep the 0.2.1 callbacks still work.
 - `SubriteProfile` no longer extends `SubriteJWT`, and `name`, `email` and `image` are optional.
   Use the new `SubriteSession` type to augment `Session` (see the README).
 - A path in `subriteUrl` is now kept. `https://example.com/tenant` gives
@@ -23,27 +23,39 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 - `isAccessTokenExpired(token, marginSeconds = 60)`. Refreshes a little before the access token
   expires, so it doesn't run out in the middle of a request.
-- `SubriteSession` and `SubriteTokenError` types.
+- `generatePostSignOutUrl` takes `{ state, idTokenHint }`. The README shows how `state` stops
+  other sites from signing your users out.
+- `SubriteSession`, `SubriteTokenError`, `RefreshParams` and `SignOutOptions` types.
+  `subriteUrl` accepts a `URL` as well as a string.
 - `refreshAccessToken` takes an optional `timeoutMs` (default 10 seconds) and `client`.
 
 ### Fixed
 
-- `refreshAccessToken` no longer writes tokens to the log when Subrite sends an unexpected
-  response.
-- A temporary failure (network error, timeout, 5xx, 429) no longer marks the session with
-  `RefreshAccessTokenError`. The token is left as is and the refresh is tried again after 10
-  seconds.
-- When Subrite rejects the refresh token, the token is marked with `RefreshAccessTokenError`, the
-  rejected refresh token is removed, and Subrite is not called again for that session.
+- `refreshAccessToken` no longer writes tokens to the log.
+- Only an OAuth error from Subrite that rejects the token (such as `invalid_grant`) marks the
+  session with `RefreshAccessTokenError`. Then the rejected refresh token is removed and Subrite
+  is not asked again for that session. In 0.2.1 any failure, even a network blip, set the error
+  for good.
+- Other failures leave the token as is: network errors, timeouts, a response that breaks off,
+  5xx, 408, 429, `invalid_client`, and client errors without an OAuth error code (a firewall or
+  CDN page). The refresh is tried again after 10 seconds, waiting twice as long after each
+  failure in a row, up to 5 minutes.
 - Sessions that 0.2.1 marked with `RefreshAccessTokenError` after a temporary failure recover on
-  the next refresh. 0.2.1 never removed the mark.
-- Parallel requests in the same server process share one refresh, so a rotated refresh token is
-  never sent twice. Results are never shared between different Subrite servers or clients.
-- `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, and
-  authenticates the same way as the sign in (HTTP Basic, unless Subrite only supports
-  `client_secret_post`).
+  the next refresh.
+- Requests that hold the same refresh token share one refresh within a server process, also
+  across the copies of the library that Next.js loads for different routers. A later request
+  with an old cookie gets the new tokens from memory until the new access token is about to
+  expire, instead of sending the used refresh token again. Results are never shared between
+  different Subrite servers or clients.
+- `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, never
+  follows redirects, and authenticates the same way as the sign in (HTTP Basic, unless Subrite
+  only supports `client_secret_post`).
+- A token response without `expires_in` keeps the new tokens and assumes 5 minutes, instead of
+  throwing away a refresh token Subrite may already have replaced. `expires_in` may be a numeric
+  string.
 - The profile picture is read from the standard `picture` claim, falling back to `image`.
-- TypeScript types now resolve with `moduleResolution` set to `bundler`, `node16` or `nodenext`.
+- TypeScript types now resolve with `moduleResolution` set to `bundler`, `node16` or `nodenext`,
+  and work with `exactOptionalPropertyTypes`.
 - The package `exports` declare their types.
 
 ## [0.2.1] - 2024-10-28
@@ -75,7 +87,7 @@ This version was removed from npm.
 
 ### Added
 
-- Added documentaion
+- Added documentation
 - Added `refreshAccessToken` function
 - Added `generatePostSignOutUrl` function
 

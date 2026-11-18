@@ -3,8 +3,11 @@
   "compilerOptions": {
     "module": "CommonJS",
     "moduleResolution": "node10",
-    "ignoreDeprecations": "6.0"
+    "ignoreDeprecations": "6.0",
+    "exactOptionalPropertyTypes": true,
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"]
   },
   "include": ["current"],
-  "exclude": ["current/*.cts"]
+  "exclude": ["current/*.cts", "current/*.tsx"]
 }

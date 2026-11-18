@@ -52,8 +52,10 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier \"{src,example,test,scripts}/**/*.{ts,cts}\" --write",
     "format:check": "prettier \"{src,example,test,scripts}/**/*.{ts,cts}\" --check",
-    "upgrade": "npx npm-check-updates --upgrade",
+    "upgrade": "npx npm-check-updates --upgrade --reject typescript,@types/node",
     "prepare": "husky",
+    "prepack": "npm run compile",
+    "preversion": "npm run lint && npm run format:check && npm run typecheck && npm test",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run test:package"
   },
   "peerDependencies": {
@@ -62,6 +64,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
     "eslint": "10.15.0",
     "eslint-config-prettier": "10.1.8",
     "husky": "9.1.7",

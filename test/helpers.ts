@@ -19,9 +19,10 @@ export function fakeSubrite(options: {
 }) {
   const subriteUrl = `https://${unique('subrite')}.example.com`;
   const tokenEndpoint = `${subriteUrl}/api/oidc/token`;
-  const calls = { discovery: 0, token: [] as TokenRequest[] };
+  const calls = { discovery: 0, token: [] as TokenRequest[], redirects: [] as unknown[] };
   mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
+    calls.redirects.push(init?.redirect);
     if (url === `${subriteUrl}/api/oidc/.well-known/openid-configuration`) {
       calls.discovery += 1;
       if (options.discoveryStatus) {

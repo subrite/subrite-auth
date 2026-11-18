@@ -1,7 +1,7 @@
 // Checks the package the way apps get it from npm: builds and packs it, unpacks it into the
 // fixture apps in test/package, then type checks and imports it there.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +12,18 @@ const tsc = join(root, 'node_modules', '.bin', 'tsc');
 
 function run(command: string, args: string[], cwd = root): void {
   execFileSync(command, args, { cwd, stdio: 'inherit' });
+}
+
+// The README components in the fixture app must match the README, so the docs stay compiled.
+const readme = readFileSync(join(root, 'README.md'), 'utf8');
+const readmeBlocks = [...readme.matchAll(/```tsx\n([\s\S]*?)```/g)].map((match) => match[1]);
+const copyHeader =
+  '// Copied from the README. scripts/test-package.ts checks that it still matches.\n';
+for (const file of ['sign-out-button.tsx', 'logout-page.tsx', 'session-guard.tsx']) {
+  const copy = readFileSync(join(fixtures, 'current', file), 'utf8');
+  if (!copy.startsWith(copyHeader) || !readmeBlocks.includes(copy.slice(copyHeader.length))) {
+    throw new Error(`test/package/current/${file} no longer matches its code block in README.md`);
+  }
 }
 
 run('npm', ['run', 'compile']);

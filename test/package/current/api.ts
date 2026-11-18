@@ -22,6 +22,10 @@ isAccessTokenExpired({ accessTokenExpires: 0 }, '60');
 // @ts-expect-error the sign out URL is a string
 const notANumber: number = generatePostSignOutUrl('https://a.example', 'id', 'https://b.example');
 
+export const signOutUrl: string = generatePostSignOutUrl('https://a.example', 'id', 'https://b', {
+  state: 'state',
+});
+
 export const values = { notANumber, refreshAccessToken, toSubriteJWT };
 export type Types = [
   RefreshParams,

@@ -8,13 +8,15 @@ The package supports Node.js 22 and later, and CI runs every check on both 22 an
     npm ci
     npm test
 
-| Script                 | What it does                                      |
-| ---------------------- | ------------------------------------------------- |
-| `npm test`             | Runs the tests with the Node.js test runner       |
-| `npm run typecheck`    | Type checks `src`, `example` and `test`           |
-| `npm run lint`         | Lints with ESLint. `npm run lint:fix` fixes       |
-| `npm run format`       | Formats with Prettier. `format:check` only checks |
-| `npm run compile`      | Builds `dist` with tsup                           |
+| Script                 | What it does                                                  |
+| ---------------------- | ------------------------------------------------------------- |
+| `npm test`             | Runs the tests with the Node.js test runner                   |
+| `npm run test:package` | Builds and packs the package, then checks it in fixture apps  |
+| `npm run typecheck`    | Type checks `src`, `example`, `test` and `scripts`            |
+| `npm run lint`         | Lints with ESLint. `npm run lint:fix` fixes                   |
+| `npm run format`       | Formats with Prettier. `format:check` only checks             |
+| `npm run compile`      | Builds `dist` with tsup                                       |
+| `npm run upgrade`      | Updates dependencies, except the majors Dependabot also skips |
 
 A pre-commit hook (husky and lint-staged) lints and formats the files you commit.
 CI runs all checks on every push to `develop` and on pull requests.
@@ -35,13 +37,14 @@ Commit the change:
 
 ### Bump the version
 
-This updates `package.json`, commits, and creates the `vX.Y.Z` tag:
+`preversion` runs the lint, format check, type check and tests first. Then this updates
+`package.json`, commits, and creates the `vX.Y.Z` tag:
 
     npm version X.Y.Z
     git push --follow-tags
 
 ### Publish to npm
 
-`prepublishOnly` runs the lint, type check, tests and build first.
+`prepublishOnly` runs the lint, type check, tests and package check first.
 
     npm publish --access public
