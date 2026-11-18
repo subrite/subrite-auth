@@ -1,22 +1,23 @@
 {
   "compilerOptions": {
-    "outDir": "dist/esm",
-    "target": "ESNext",
+    "target": "ES2024",
+    "lib": ["ES2024"],
     "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
     "strict": true,
-    "moduleResolution": "node",
-    "sourceMap": true,
-    "experimentalDecorators": true,
-    "pretty": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
     "noFallthroughCasesInSwitch": true,
     "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "declaration": true,
-    "downlevelIteration": true,
-    "lib": ["ESNext", "DOM"]
+    "resolveJsonModule": true
   },
-  "exclude": ["dist", "node_modules"]
+  "include": ["src", "example", "test"]
 }

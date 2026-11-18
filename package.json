@@ -7,76 +7,77 @@
     "email": "post@subrite.no",
     "url": "https://www.subrite.no"
   },
-  "files": [
-    "./dist"
-  ],
-  "type": "module",
-  "main": "./dist/index.cjs",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/subrite/subrite-auth.git"
   },
+  "homepage": "https://github.com/subrite/subrite-auth#readme",
+  "bugs": "https://github.com/subrite/subrite-auth/issues",
   "keywords": [
     "next-auth",
     "subrite",
     "nextjs"
   ],
-  "scripts": {
-    "compile": "tsup --external next-auth --dts --format cjs,esm --clean src/index.ts",
-    "lint": "eslint {src,example}/**/*.ts --fix",
-    "upgrade": "npm-check-updates --upgrade",
-    "prepare": "husky install",
-    "lint-staged": "lint-staged",
-    "format": "prettier '{src,example}/**/*.ts' --write",
-    "prepublishOnly": "npm run lint && npm run compile"
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
-  "repository": "skavl-media/subrite-auth",
-  "license": "MIT",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "compile": "tsup src/index.ts --format cjs,esm --dts --clean --target node24 --external next-auth",
+    "typecheck": "tsc",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier \"{src,example,test}/**/*.ts\" --write",
+    "format:check": "prettier \"{src,example,test}/**/*.ts\" --check",
+    "upgrade": "npx npm-check-updates --upgrade",
+    "prepare": "husky",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run compile"
+  },
   "peerDependencies": {
-    "next-auth": "^4.24.x"
+    "next-auth": "^4.24.15"
   },
   "devDependencies": {
-    "@types/node": "20.8.7",
-    "@typescript-eslint/eslint-plugin": "6.8.0",
-    "@typescript-eslint/parser": "6.8.0",
-    "eslint": "8.51.0",
-    "eslint-config-prettier": "9.0.0",
-    "husky": "8.0.3",
-    "lint-staged": "15.0.1",
-    "npm-check-updates": "16.14.6",
-    "prettier": "3.0.3",
-    "tsup": "7.2.0",
-    "typescript": "5.2.2"
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.15.0",
+    "eslint-config-prettier": "10.1.8",
+    "husky": "9.1.7",
+    "lint-staged": "17.6.1",
+    "next-auth": "4.24.15",
+    "prettier": "3.10.1",
+    "tsup": "9.0.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
   },
   "lint-staged": {
     "*.ts": [
-      "eslint --quiet --fix"
+      "eslint --fix",
+      "prettier --write"
     ],
-    "*.{json,ts}": [
+    "*.json": [
       "prettier --write"
     ]
-  },
-  "husky": {
-    "hooks": {
-      "pre-commit": "lint-staged"
-    }
-  },
-  "eslintConfig": {
-    "parser": "@typescript-eslint/parser",
-    "parserOptions": {
-      "ecmaVersion": "latest",
-      "sourceType": "module"
-    },
-    "extends": [
-      "eslint:recommended",
-      "plugin:@typescript-eslint/recommended",
-      "prettier"
-    ],
-    "env": {
-      "node": true
-    }
   }
 }
