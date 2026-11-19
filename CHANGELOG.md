@@ -21,20 +21,25 @@ Installing:
 - Requires `next-auth` 4.24.15 or later. Older versions have known security issues. When
   `next-auth` is a caret range in package.json (npm's default), npm upgrades it in the same
   install. When it is pinned to an older version, npm fails with `ERESOLVE`. pnpm and yarn only
-  warn, and so does npm when the provider comes in through another package. `next-auth` 4.24.15
-  changes two things itself: `NEXTAUTH_URL` now wins over the host Vercel detects, and a sign in
-  started before the deploy fails once at the callback.
+  warn, and so does npm when the provider comes in through another package. Apps that depend on
+  `nodemailer` must move to nodemailer 7 (`^7.0.7`) in the same install, or npm fails with
+  `ERESOLVE`. `next-auth` 4.24.15 changes two things itself: `NEXTAUTH_URL` now wins over the host
+  from the request headers (used on Vercel and with `AUTH_TRUST_HOST`), and a sign in started
+  before the deploy fails once at the callback.
 
 TypeScript:
 
 - With `moduleResolution` set to `bundler` (the Next.js default), `node16` or `nodenext`, the
   0.2.x types resolved to `any`, so nothing was checked. Now they are. Env vars passed to
-  `Subrite()` need `!` or a check. A separate config object that sets `checks` or `style` needs
+  `Subrite()` need `!` or a check. A separate config object that sets `checks` needs
   `satisfies SubriteConfig`. A `profile` override takes `SubriteClaims` (not
   `Record<string, unknown>`), and must return the tokens while the `User` augmentation has them.
-- `SubriteJWT` has an optional `error`: a string, `null` or `undefined`. A type that narrows
-  `error` on the result of `refreshAccessToken` no longer fits. `SubriteTokens` has only the three
-  token fields.
+- With any `moduleResolution`: `SubriteJWT` has an optional `error`: a string, `null` or
+  `undefined`. A type that narrows `error` on the result of `refreshAccessToken`, a non-string
+  value in `token.error`, `error?: unknown` in a `JWT` augmentation, and `keyof SubriteJWT` no
+  longer fit. `SubriteTokens` has only the three token fields. Tests that call
+  `provider.profile()` pass only the claims. `Parameters<typeof refreshAccessToken>[1]` has a
+  `subriteUrl` that may be a `URL`.
 - New exports can clash with your own names in `export *` re-exports.
 - `SubriteProfile` is marked `@deprecated`, so `@typescript-eslint/no-deprecated` reports the
   0.2.x augmentation.
@@ -53,8 +58,9 @@ Refreshing:
 - Only `invalid_grant` from Subrite marks the session with `RefreshAccessTokenError`, and then
   `refreshToken` is an empty string. Other failures return the token unchanged, with its expired
   access token, and that refresh token is tried again after 10 seconds, doubling up to 5 minutes,
-  or when `Retry-After` says. When three different refresh tokens fail with no answer from Subrite
-  in between, refreshes for the client pause for 10 seconds, growing to a minute. Three broken
+  or when `Retry-After` says (between 10 seconds and 5 minutes). When three different refresh
+  tokens fail with no answer from Subrite in between, refreshes for the client pause for 10
+  seconds, growing to a minute (or as long as `Retry-After` says, up to 5 minutes). Three broken
   accounts failing in a quiet moment look the same, so they can hold other users up briefly.
 - The refresh reads Subrite's OpenID configuration first (once an hour per server process) and
   authenticates like the sign in, with HTTP Basic unless Subrite only supports
@@ -62,7 +68,9 @@ Refreshing:
   secret in the form to `/api/oidc/token`.
 - Refreshes are shared within a server process. A second refresh with the same refresh token
   within 30 seconds gets the same access token without asking Subrite.
-- A refresh gives up after 30 seconds (`timeoutMs`). 0.2.x waited as long as `fetch` did.
+- A refresh gives up after 30 seconds (`timeoutMs`). 0.2.x waited as long as `fetch` did. When
+  Subrite replaces refresh tokens, a refresh given up after Subrite handled it means the user must
+  sign in again.
 - Log messages changed. Errors still start with `Error refreshing access token`, now followed by
   a colon and `{ status, error, error_description }`.
 - App tests that mock `fetch` must also answer the OpenID configuration request, expect HTTP
@@ -90,12 +98,12 @@ Refreshing:
 - `resetRefreshState()`, so app tests can start each test with empty memory.
 - Public clients: with `token_endpoint_auth_method: 'none'`, or an empty client secret, the
   refresh sends only the client id.
-- `SubriteClaims`, `SubriteSession`, `SubriteTokens`, `SubriteTokenError`, `RefreshParams` and
-  `SignOutOptions` types. `RefreshParams.subriteUrl` and `generatePostSignOutUrl` accept a `URL`
+- `SubriteClaims`, `SubriteSession`, `SubriteTokens`, `SubriteTokenError`, `SubriteProvider`,
+  `SubriteUser`, `SubriteAuthMethod`, `RefreshParams` and `SignOutOptions` types. `RefreshParams.subriteUrl` and `generatePostSignOutUrl` accept a `URL`
   as well as a string.
 - A warning when `subriteUrl` has a path, which is ignored as before, and an error when the
-  config sets a `token_endpoint_auth_method` the refresh can't use. Each is logged once per
-  process.
+  config sets a `token_endpoint_auth_method` the refresh can't use (or that is no method at all).
+  Each is logged once per process.
 
 ### Fixed
 
@@ -108,20 +116,23 @@ Refreshing:
 - Failures that are not about the token keep the session: network errors, timeouts, a response
   that breaks off or has no tokens, redirects, 5xx, 429, firewall or CDN pages, and client
   configuration errors such as `invalid_client`, `unauthorized_client` or `invalid_request`.
-  That refresh token waits 10 seconds (or as long as `Retry-After` says), doubling with each
-  failure in a row up to 5 minutes, so a refresh token that keeps failing only delays itself.
-  When three different refresh tokens fail with no answer from Subrite in between (no new tokens
-  and no rejection), refreshes for that Subrite client pause for 10 seconds, growing to at most a
-  minute, and one request at a time checks whether Subrite is back. The pause does not grow for
-  `500 server_error`, which can be one account's bad data, so broken accounts add 10 seconds each
-  at most. When a check finds Subrite back, everyone refreshes right away.
+  That refresh token waits 10 seconds (or as long as `Retry-After` says, up to 5 minutes),
+  doubling with each failure in a row up to 5 minutes, so a refresh token that keeps failing only
+  delays itself. When three different refresh tokens fail with no answer from Subrite in between
+  (no new tokens and no rejection), refreshes for that Subrite client pause for 10 seconds,
+  growing to at most a minute unless `Retry-After` asks for longer, and one request at a time
+  checks whether Subrite is back. The pause does not grow for `500 server_error`, which can be
+  one account's bad data, so each broken account adds 10 seconds plus how long its check waits on
+  Subrite. When a check finds Subrite back, everyone refreshes right away. Signing out twice while
+  a check runs, or a clock that steps back, doesn't hold refreshes up.
 - Requests that hold the same refresh token share one refresh within a server process, also
   across the copies of the library that Next.js loads for different routers. When Subrite
   replaced the refresh token, a later request with an old cookie gets the new tokens from memory
   until the new access token is about to expire (`oldCookieGraceSeconds` can shorten this),
   instead of sending the used refresh token again. When Subrite kept it, results are shared for
   30 seconds at most. An expired access token is never handed out. Results are never shared
-  between different Subrite servers or clients.
+  between different Subrite servers or clients, and one server is the same however its URL is
+  written.
 - `refreshAccessToken` reads the token endpoint from Subrite's OpenID configuration, never
   follows redirects (and works on Cloudflare Workers), and authenticates the same way as the sign
   in: HTTP Basic, `client_secret_post` or `none`.
@@ -134,9 +145,11 @@ Refreshing:
 - Works in test environments without `AbortSignal.timeout`, such as Jest 29 with jsdom.
 - TypeScript types resolve with `moduleResolution` set to `bundler`, `node16` or `nodenext`, and
   work with `exactOptionalPropertyTypes`. These 0.2.x patterns still compile: a `profile`
-  override typed with `SubriteProfile`, a `client` option in a plain config object, a config with
-  `httpOptions` passed to `refreshAccessToken`, `error: null`, and a JWT augmentation that narrows
-  `error` to `'RefreshAccessTokenError'`.
+  override typed with `SubriteProfile`, or one that returns `undefined` for a missing claim, a
+  `client` option in a plain config object, a partial `style`, a config with `httpOptions` passed
+  to `refreshAccessToken`, `error: null`, a JWT augmentation that narrows `error` to
+  `'RefreshAccessTokenError'`, and a test double for `Subrite()` without `options`. TypeScript 4.9
+  can emit declarations for values made with `Subrite()`.
 - The package `exports` declare their types.
 
 ## [0.2.1] - 2024-10-28

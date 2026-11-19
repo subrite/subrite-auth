@@ -21,8 +21,9 @@ export interface SubriteTokens {
 /** The Subrite tokens kept in the NextAuth JWT. */
 export interface SubriteJWT extends SubriteTokens {
   /**
-   * `'RefreshAccessTokenError'` when Subrite rejected the refresh token and the user must sign in
-   * again. The library leaves other values your app sets alone.
+   * `'RefreshAccessTokenError'` with an empty `refreshToken` when Subrite rejected the refresh
+   * token and the user must sign in again. With a refresh token it is a stale 0.2.x flag, which
+   * the next successful refresh removes. The library leaves other values your app sets alone.
    */
   error?: SubriteTokenError | (string & {}) | null | undefined;
 }
@@ -193,8 +194,8 @@ const BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 // When this many different refresh tokens fail for the first time with no answer from Subrite in
 // between (new tokens or a rejection), Subrite is likely down for the client, or the client is
-// misconfigured. Its refreshes then pause the same way, but for
-// at most a minute, so users get new tokens soon after Subrite is back.
+// misconfigured. Its refreshes then pause the same way, but for at most a minute (unless
+// Retry-After asks for longer), so users get new tokens soon after Subrite is back.
 const OUTAGE_MIN_FAILING_TOKENS = 3;
 const MAX_OUTAGE_PAUSE_MS = 60_000;
 // Failures further apart than this don't count as in a row, and don't add up to an outage.

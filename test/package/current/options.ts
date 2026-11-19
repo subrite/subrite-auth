@@ -45,8 +45,11 @@ export const options: NextAuthOptions = {
       // Only needed if code in the browser calls Subrite with the access token.
       session.accessToken = token.accessToken;
       // Lets the browser see that the user must sign in again. A token that still has its refresh
-      // token is fine: 0.2.x could leave a stale error on it.
-      session.error = token.refreshToken ? undefined : token.error;
+      // token is fine: 0.2.x could leave a stale error on it. (Leave the key out rather than set
+      // it to undefined, which getServerSideProps can't serialize.)
+      if (token.error && !token.refreshToken) {
+        session.error = token.error;
+      }
       return session;
     },
   },
