@@ -111,6 +111,14 @@ describe('Subrite provider', () => {
       });
     }
     assert.equal(loggedText().match(/private_key_jwt works for sign in/g)?.length, 1);
+    // A typo is not a sign in method either.
+    Subrite({
+      clientId: 'id',
+      clientSecret: 's',
+      subriteUrl: 'https://auth.example.com',
+      client: { token_endpoint_auth_method: 'client_secret_postt' },
+    });
+    assert.match(loggedText(), /client_secret_postt is not a known method, so sign in and/);
   });
 });
 
@@ -482,6 +490,33 @@ describe('refreshAccessToken', () => {
     assert.equal(subrite.calls.token.length, 1);
     for (const result of results) {
       assert.equal(result.accessToken, 'new-access');
+      assert.equal(result.refreshToken, 'new-refresh');
+    }
+  });
+
+  it('shares one call however the Subrite URL is written', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const subrite = fakeSubrite({
+      token: async () => {
+        await gate;
+        return ok({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 60 });
+      },
+    });
+    const token = sessionToken();
+    const spellings = [
+      subrite.subriteUrl,
+      new URL(subrite.subriteUrl),
+      `${subrite.subriteUrl}/`,
+      subrite.subriteUrl.toUpperCase(),
+    ];
+    const pending = spellings.map((subriteUrl) =>
+      refreshAccessToken({ ...token }, { ...subrite.params, subriteUrl }),
+    );
+    release();
+    const results = await Promise.all(pending);
+    assert.equal(subrite.calls.token.length, 1);
+    for (const result of results) {
       assert.equal(result.refreshToken, 'new-refresh');
     }
   });

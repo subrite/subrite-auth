@@ -728,6 +728,52 @@ describe('outages', () => {
     );
   });
 
+  it('a clock that goes backwards does not stretch the wait after a failure', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start });
+    let isDown = true;
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+    const token = sessionToken();
+    await refreshAccessToken(token, subrite.params); // waits 10 s
+    isDown = false;
+    mock.timers.setTime(start - 10 * MINUTE);
+    assert.match((await refreshAccessToken(token, subrite.params)).accessToken, /^access-/);
+  });
+
+  for (const answer of ['back', 'still down'] as const) {
+    it(`keeps checking when a refresh token is revoked twice while it checks (Subrite ${answer})`, async () => {
+      const tick = fakeClock();
+      let isDown = true;
+      let release: () => void = () => {};
+      let gate: Promise<void> = Promise.resolve();
+      const subrite = fakeSubrite({
+        token: async () => {
+          await gate;
+          return isDown ? down() : rotatingTokens();
+        },
+      });
+      await startOutage(subrite.params);
+      tick(10_000);
+      gate = new Promise<void>((resolve) => (release = resolve));
+      const checking = sessionToken();
+      const check = refreshAccessToken(checking, subrite.params);
+      // The user signs out twice (a double click, or two tabs) while the check waits on Subrite.
+      await revokeRefreshToken(checking, subrite.params);
+      await revokeRefreshToken(checking, subrite.params);
+      isDown = answer === 'still down';
+      release();
+      await check;
+      isDown = false;
+      tick(answer === 'back' ? 0 : 20_000);
+      assert.match(
+        (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+        /^access-/,
+      );
+      const signedOut = await refreshAccessToken(checking, subrite.params);
+      assert.equal(signedOut.error, 'RefreshAccessTokenError', 'the revocation still holds');
+    });
+  }
+
   it('keeps sessions of other Subrite clients going', async () => {
     const broken = fakeSubrite({ token: down });
     const working = fakeSubrite({ token: rotatingTokens });

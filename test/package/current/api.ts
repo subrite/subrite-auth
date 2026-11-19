@@ -11,11 +11,14 @@ import Subrite, {
   type SignOutOptions,
   type SubriteClaims,
   type SubriteConfig,
+  type SubriteAuthMethod,
   type SubriteJWT,
   type SubriteProfile,
+  type SubriteProvider,
   type SubriteSession,
   type SubriteTokenError,
   type SubriteTokens,
+  type SubriteUser,
 } from '@subrite/next-auth-provider';
 
 // @ts-expect-error clientId is required
@@ -78,6 +81,28 @@ export const refreshedWithConfig = refreshAccessToken(
 
 // The provider keeps its options typed.
 export const providerUrl: string = Subrite(typedConfig).options.subriteUrl;
+export const provider: SubriteProvider = Subrite(typedConfig);
+
+// An untyped override that returns missing claims as undefined compiled with 0.2.1 under node10,
+// also with exactOptionalPropertyTypes. So does the README's override that keeps the 0.2.x values.
+export const untyped: SubriteProvider = Subrite({
+  ...typedConfig,
+  profile(profile) {
+    return { id: profile.sub, name: profile.name, email: profile.email, image: profile.image };
+  },
+});
+export const keeps02x: SubriteProvider = Subrite({
+  ...typedConfig,
+  profile(claims, tokens) {
+    return {
+      id: claims.sub,
+      name: claims.name,
+      email: claims.email,
+      image: claims.image,
+      ...toSubriteJWT(tokens),
+    };
+  },
+});
 
 Subrite({
   ...typedConfig,
@@ -98,10 +123,12 @@ export const values = { notANumber, refreshAccessToken, toSubriteJWT };
 export type Types = [
   RefreshParams,
   SignOutOptions,
+  SubriteAuthMethod,
   SubriteConfig,
   SubriteJWT,
   SubriteProfile,
   SubriteSession,
   SubriteTokenError,
   SubriteTokens,
+  SubriteUser,
 ];

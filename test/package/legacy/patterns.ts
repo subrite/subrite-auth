@@ -45,8 +45,20 @@ const withRoles = Subrite({
   },
 });
 
+// A button style with only some of the values NextAuth's sign in page reads.
+const styled = Subrite({ ...signedConfig, style: { logo: '/subrite.svg', bg: '#fff' } });
+
+// A test double for the provider, without `options`, as jest.mocked(Subrite).mockReturnValue
+// takes it.
+export const double: ReturnType<typeof Subrite> = {
+  id: 'subrite',
+  name: 'Subrite',
+  type: 'oauth',
+  profile: () => Promise.reject(new Error('not called in this test')),
+};
+
 export const options: NextAuthOptions = {
-  providers: [withRoles, Subrite(proxyConfig), Subrite(signedConfig)],
+  providers: [withRoles, Subrite(proxyConfig), Subrite(signedConfig), styled],
   callbacks: {
     async jwt({ token, account }) {
       if (account) {

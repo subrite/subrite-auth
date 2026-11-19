@@ -1,6 +1,10 @@
 import type { Awaitable, TokenSet, User } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
-import type { OAuthConfig, OAuthUserConfig } from 'next-auth/providers/oauth';
+import type {
+  OAuthConfig,
+  OAuthProviderButtonStyles,
+  OAuthUserConfig,
+} from 'next-auth/providers/oauth';
 
 /** The value of `error` when Subrite rejected the refresh token. The user must sign in again. */
 export type SubriteTokenError = 'RefreshAccessTokenError';
@@ -68,16 +72,30 @@ type NamedClientMetadata = {
   ]: ClientMetadata[K];
 };
 
-export type SubriteConfig = Omit<UserConfig, 'client' | 'profile'> & {
+/** The token endpoint authentication methods the refresh supports. */
+export type SubriteAuthMethod = 'client_secret_basic' | 'client_secret_post' | 'none';
+
+/**
+ * What a profile override returns. NextAuth's `User`, except that `name`, `email` and `image` may
+ * also be `undefined`, as 0.2.x returned them for missing claims. That also compiles with
+ * `exactOptionalPropertyTypes`.
+ */
+export type SubriteUser = Omit<User, 'name' | 'email' | 'image'> & {
+  name?: string | null | undefined;
+  email?: string | null | undefined;
+  image?: string | null | undefined;
+};
+
+export type SubriteConfig = Omit<UserConfig, 'client' | 'profile' | 'style'> & {
   /** The Subrite server's origin, like `https://example.subrite.no`. A path is ignored. */
   subriteUrl: string;
   /**
-   * Client metadata for the sign in. `token_endpoint_auth_method` is any string, so a plain
-   * config object compiles. Subrite() checks the value itself.
+   * Client metadata for the sign in. `token_endpoint_auth_method` takes any string, so a plain
+   * config object compiles. Subrite() logs an error for a value the refresh doesn't support.
    */
   client?:
     | (NamedClientMetadata & {
-        token_endpoint_auth_method?: string | undefined;
+        token_endpoint_auth_method?: SubriteAuthMethod | (string & {}) | undefined;
         [key: string]: unknown;
       })
     | undefined;
@@ -85,8 +103,13 @@ export type SubriteConfig = Omit<UserConfig, 'client' | 'profile'> & {
    * Replaces the default profile mapping. A method, so overrides written for 0.2.x with a
    * `SubriteProfile` parameter still compile.
    */
-  profile?(profile: SubriteClaims, tokens: TokenSet): Awaitable<User>;
+  profile?(profile: SubriteClaims, tokens: TokenSet): Awaitable<SubriteUser>;
+  /** The button on NextAuth's built in sign in page. NextAuth fills in what is left out. */
+  style?: Partial<OAuthProviderButtonStyles> | undefined;
 };
+
+/** What Subrite() returns: a NextAuth provider whose `options` is the config passed in. */
+export type SubriteProvider = OAuthConfig<SubriteClaims> & { options: SubriteConfig };
 
 export type RefreshParams = {
   subriteUrl: string | URL;
@@ -96,7 +119,12 @@ export type RefreshParams = {
    * Only `token_endpoint_auth_method` is used. Set it if you also set it in the provider config,
    * so the refresh request authenticates the same way as the sign in.
    */
-  client?: { token_endpoint_auth_method?: string | undefined; [key: string]: unknown } | undefined;
+  client?:
+    | {
+        token_endpoint_auth_method?: SubriteAuthMethod | (string & {}) | undefined;
+        [key: string]: unknown;
+      }
+    | undefined;
   /**
    * Not used. Allowed so you can pass the provider config. NextAuth's `httpOptions.timeout` is for
    * the sign in, and refreshes go through the global `fetch`. Set `timeoutMs` instead.
@@ -135,7 +163,18 @@ export type SignOutOptions = {
 const WELL_KNOWN_PATH = 'api/oidc/.well-known/openid-configuration';
 const SIGN_OUT_PATH = 'api/oidc/session/end';
 const REFRESH_ERROR: SubriteTokenError = 'RefreshAccessTokenError';
-const SUPPORTED_AUTH_METHODS = ['client_secret_basic', 'client_secret_post', 'none'];
+const SUPPORTED_AUTH_METHODS: readonly string[] = [
+  'client_secret_basic',
+  'client_secret_post',
+  'none',
+] satisfies SubriteAuthMethod[];
+// Methods NextAuth's sign in supports, but the refresh doesn't.
+const SIGN_IN_ONLY_AUTH_METHODS: readonly string[] = [
+  'client_secret_jwt',
+  'private_key_jwt',
+  'tls_client_auth',
+  'self_signed_tls_client_auth',
+];
 
 // Generous: when Subrite replaces refresh tokens, a refresh given up after Subrite handled it
 // leaves the session with a used refresh token. Still well below fetch's own 300 seconds.
@@ -167,16 +206,21 @@ const MAX_REFRESH_ENTRIES = 10_000;
 const PRUNE_INTERVAL_MS = 10_000;
 const DISCOVERY_CACHE_MS = 60 * 60 * 1000;
 
-export default function Subrite(
-  config: SubriteConfig,
-): OAuthConfig<SubriteClaims> & { options: SubriteConfig } {
+// Calls get the first signature, with a typed `options`. ReturnType, jest.mocked and vi.mocked
+// read the last one, so test doubles written for 0.2.x without `options` still compile.
+export default function Subrite(config: SubriteConfig): SubriteProvider;
+export default function Subrite(config: SubriteConfig): OAuthConfig<SubriteClaims>;
+export default function Subrite(config: SubriteConfig): SubriteProvider {
   warnAboutPath(config.subriteUrl);
   const authMethod = config.client?.token_endpoint_auth_method;
   if (authMethod !== undefined && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
     logOnce(
       `auth-method:${authMethod}`,
-      `Subrite: token_endpoint_auth_method ${authMethod} works for sign in, but ` +
-        'refreshAccessToken only supports client_secret_basic, client_secret_post and none.',
+      SIGN_IN_ONLY_AUTH_METHODS.includes(authMethod)
+        ? `Subrite: token_endpoint_auth_method ${authMethod} works for sign in, but ` +
+            'refreshAccessToken only supports client_secret_basic, client_secret_post and none.'
+        : `Subrite: token_endpoint_auth_method ${authMethod} is not a known method, so sign in ` +
+            'and refreshAccessToken will fail. Use client_secret_basic, client_secret_post or none.',
       'error',
     );
   }
@@ -292,6 +336,8 @@ type RefreshEntry = {
   duringOutage: boolean;
   /** Whether a late reuse of this entry has been logged. */
   warned?: boolean;
+  /** state.generation when the entry was made. */
+  generation: number;
 };
 
 /** How Subrite has been answering for one Subrite URL and client id. */
@@ -324,6 +370,8 @@ type State = {
   refreshes: Map<string, RefreshEntry>;
   clients: Map<string, ClientHealth>;
   lastPrune: number;
+  /** Counts resetRefreshState calls, so refreshes still in progress then are ignored. */
+  generation: number;
 };
 
 // Next.js can load several copies of this module into one process, for example one for the
@@ -342,6 +390,7 @@ const state = /* @__PURE__ */ processWide<State>('state', () => ({
   refreshes: new Map(),
   clients: new Map(),
   lastPrune: 0,
+  generation: 0,
 }));
 
 /**
@@ -472,7 +521,11 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
   const existing = state.refreshes.get(key);
   // A failure during an outage is not the token's fault. Once Subrite answers again, try now.
   const forgiven = existing !== undefined && isForgiven(existing, health);
-  if (existing && existing.reuseUntil > now && !forgiven) {
+  // A clock that went backwards (for example an NTP correction) would stretch the wait after a
+  // failure by the size of the step. Try now instead: the backoff and outage checks still apply.
+  const clockWentBack =
+    existing?.settled?.kind === 'temporary-failure' && (existing.settledAt ?? 0) > now;
+  if (existing && existing.reuseUntil > now && !forgiven && !clockWentBack) {
     warnOnLateReuse(existing, now);
     return existing.outcome;
   }
@@ -513,6 +566,7 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
     probe,
     freshProbe,
     duringOutage: false,
+    generation: state.generation,
   };
   // Delete first, so the Map's insertion order stays oldest first for pruning.
   state.refreshes.delete(key);
@@ -565,8 +619,9 @@ function settle(
   outcome: RefreshOutcome,
   params: RefreshParams,
 ): void {
-  // Dropped by resetRefreshState while in progress: it belongs to a test that is over.
-  if (state.refreshes.get(key) !== entry) return;
+  // Started before resetRefreshState: it belongs to a test that is over. (Not whether the entry
+  // is still in the map: a second revocation replaces it, and its outcome must still count.)
+  if (entry.generation !== state.generation) return;
   const now = Date.now();
   // Revoked while the request was in progress: the revocation wins.
   const revoked = entry.settled !== undefined;
@@ -726,11 +781,22 @@ function warnOnLateReuse(entry: RefreshEntry, now: number): void {
 
 // One app can talk to several Subrite servers or clients. Never share results between them.
 function clientKeyOf(params: RefreshParams): string {
-  return JSON.stringify([String(params.subriteUrl), params.clientId]);
+  return JSON.stringify([serverOf(params.subriteUrl), params.clientId]);
 }
 
 function refreshKeyOf(params: RefreshParams, refreshToken: string): string {
-  return JSON.stringify([String(params.subriteUrl), params.clientId, refreshToken]);
+  return JSON.stringify([serverOf(params.subriteUrl), params.clientId, refreshToken]);
+}
+
+// The origin, since a path is ignored anyway. A string, a URL or a trailing slash is one server.
+function serverOf(subriteUrl: string | URL): string {
+  let origin = 'null';
+  try {
+    origin = new URL(subriteUrl).origin;
+  } catch {
+    // An invalid URL fails loudly when it is used.
+  }
+  return origin === 'null' ? String(subriteUrl) : origin;
 }
 
 // After a revocation, neither this refresh token nor old cookies that it replaced may get
@@ -750,6 +816,7 @@ function forgetRefreshToken(refreshToken: string, params: RefreshParams): void {
     probe: false,
     freshProbe: false,
     duringOutage: false,
+    generation: state.generation,
   });
   for (const [key, entry] of state.refreshes) {
     if (!key.startsWith(prefix)) continue;
@@ -1158,6 +1225,7 @@ function warnOnce(key: string, message: string): void {
  * fresh. An app never needs it.
  */
 export function resetRefreshState(): void {
+  state.generation += 1;
   state.refreshes.clear();
   state.clients.clear();
   state.lastPrune = 0;
