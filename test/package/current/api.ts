@@ -8,6 +8,7 @@ import Subrite, {
   toSubriteJWT,
   type RefreshParams,
   type SignOutOptions,
+  type SubriteClaims,
   type SubriteConfig,
   type SubriteJWT,
   type SubriteProfile,
@@ -38,6 +39,20 @@ export const revoked: Promise<boolean> = revokeRefreshToken({ refreshToken: 'r' 
 
 // @ts-expect-error oldCookieGraceSeconds is a number of seconds
 export const badParams: RefreshParams = { ...params, oldCookieGraceSeconds: '30' };
+
+// Extra fields, as in the `account` NextAuth passes, are fine.
+export const fromAccount: SubriteJWT = toSubriteJWT({
+  access_token: 'a',
+  refresh_token: 'r',
+  expires_at: 1,
+  id_token: 'i',
+  scope: 'openid offline_access',
+});
+
+// Apps may keep their own error values on the token.
+export const ownError: SubriteJWT = { ...fromAccount, error: 'MyOwnError' };
+
+export const claims: SubriteClaims = { sub: 'user-1' };
 
 export const values = { notANumber, refreshAccessToken, toSubriteJWT };
 export type Types = [

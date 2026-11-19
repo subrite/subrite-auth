@@ -49,9 +49,7 @@ The following JavaScript code illustrates how to construct a logout URL for Subr
 
 ```typescript
 // Construct a URL object for the Subrite sign out endpoint.
-// The trailing slash keeps any path that SUBRITE_URL has.
-const base = subriteUrl.endsWith('/') ? subriteUrl : `${subriteUrl}/`;
-const subriteSignoutUrl = new URL('api/oidc/session/end', base);
+const subriteSignoutUrl = new URL('/api/oidc/session/end', subriteUrl);
 // Tell subrite what client we are signing out from
 subriteSignoutUrl.searchParams.append('client_id', clientId);
 // Tell subrite where to send the user agent after signing out (where we sign out from the application)
@@ -135,7 +133,7 @@ Signing out of Subrite does not end the app sessions that use it: refresh tokens
 
 If your application uses [NextAuth.js](https://next-auth.js.org/) v4, you can use the `@subrite/next-auth-provider` NPM module.
 
-It requires Node.js 22 or later and `next-auth` 4.24.15 or later.
+It requires Node.js 22 or later and `next-auth` 4.24.15 or later. Coming from an earlier version? See [Upgrading from 0.1.x or 0.2.x](#upgrading-from-01x-or-02x).
 
 ### Installation
 
@@ -157,13 +155,15 @@ import Subrite, {
 const subriteConfig = {
   clientId: 'your-client-id',
   clientSecret: 'your-client-secret',
+  // The Subrite server's origin, like https://example.subrite.no
   subriteUrl: 'your-subrite-url',
 };
 
 export const options: NextAuthOptions = {
   providers: [Subrite(subriteConfig)],
   events: {
-    // The refresh token keeps working after the user signs out of Subrite, so revoke it.
+    // The refresh token keeps working after the user signs out of Subrite, so revoke it
+    // (where Subrite supports revocation, see "Signing out" below).
     async signOut({ token }) {
       await revokeRefreshToken(token, subriteConfig);
     },
@@ -189,8 +189,9 @@ export const options: NextAuthOptions = {
     async session({ session, token }) {
       // Only needed if code in the browser calls Subrite with the access token.
       session.accessToken = token.accessToken;
-      // Lets the browser see that the user must sign in again.
-      session.error = token.error;
+      // Lets the browser see that the user must sign in again. A token that still has its refresh
+      // token is fine: 0.2.x could leave a stale error on it.
+      session.error = token.refreshToken ? undefined : token.error;
       return session;
     },
   },
@@ -198,6 +199,10 @@ export const options: NextAuthOptions = {
 ```
 
 The ID token is validated on sign in, and the user's name, email and picture are read from it.
+
+The one minute margin of `isAccessTokenExpired` assumes access tokens live much longer (Subrite's live hours). With tokens that live a minute or two, pass a smaller margin, like `isAccessTokenExpired(token, 10)`, or every request refreshes.
+
+`refreshAccessToken` and `revokeRefreshToken` use the global `fetch`. From the provider's `httpOptions` they only use `timeout`.
 
 Subrite must give the app a refresh token without asking the user for consent each time. If your Subrite server only does that with `prompt=consent`, add `authorization: { params: { prompt: 'consent' } }` to `subriteConfig`.
 
@@ -263,11 +268,13 @@ export function SubriteSessionGuard() {
 
 On the server, check `session.error` (from `getServerSession`) or `token.error` (from `getToken`) the same way.
 
+When `refreshAccessToken` returns the token unchanged (the same `accessToken` and no `error`), the token has not been refreshed yet: Subrite was down or slow, or refreshes are paused. That is not a failed refresh, so don't sign the user out for it. Only `error === 'RefreshAccessTokenError'` means the user must sign in again.
+
 Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, a response without tokens, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
 
 - That refresh token waits 10 seconds before it is tried again (or as long as Subrite's `Retry-After` header says), doubling with each failure in a row up to 5 minutes. A refresh token that keeps failing on its own (for example because of bad data for one account) only delays itself.
-- When two different refresh tokens fail with no answer from Subrite in between, Subrite is likely in trouble. Then all refreshes for that Subrite client pause the same way, and one request at a time checks whether Subrite is back while the others keep their tokens. Requests that fail at the same moment count once, and the pause only grows when a refresh token that had not failed yet fails too. A check by a refresh token that already failed in the outage only holds back tokens like it, so a few broken accounts can't keep healthy users out.
-- As soon as Subrite answers again, everyone refreshes right away.
+- When three different refresh tokens fail with no answer from Subrite in between, Subrite is likely in trouble. Then all refreshes for that Subrite client pause for 10 seconds, and one request at a time checks whether Subrite is back while the others keep their tokens. The pause grows only when a refresh token that had not failed yet fails too, and never past one minute (unless Subrite's `Retry-After` asks for longer). Requests that fail at the same moment count once. A check by a refresh token that already failed in the outage only holds back tokens like it, so a few broken accounts can't keep healthy users out.
+- As soon as a check finds Subrite back, everyone refreshes right away. That is at most a minute after Subrite recovers.
 
 Configuration problems are logged with a hint, and sessions recover on their own once the configuration is fixed.
 
@@ -319,6 +326,24 @@ If Subrite rotates refresh tokens and rejects a reused one, that user must sign 
 
 `revokeRefreshToken(token, subriteConfig)` revokes the refresh token at Subrite. The configuration above calls it from `events.signOut`.
 It never throws, and returns `true` when Subrite confirmed the revocation. Afterwards, requests with an old cookie that holds the token are not answered from memory any more.
+
+It only works on Subrite servers whose OpenID configuration lists a `revocation_endpoint`. Elsewhere it returns `false`, logs a warning once, and the refresh token keeps working until it expires.
+NextAuth waits for `events.signOut` before it signs the user out, so `revokeRefreshToken` gives up after 3 seconds unless you set `timeoutMs`.
+
+## Upgrading from 0.1.x or 0.2.x
+
+Your existing callbacks and type augmentation keep working. These are the changes to know about:
+
+1. **Install `next-auth` 4.24.15 or later in the same step**, and use Node.js 22 or later. npm refuses to install this version next to an older `next-auth` (`ERESOLVE`), and older versions have known security issues.
+
+       npm install @subrite/next-auth-provider@^0.3.0 next-auth@^4.24.15
+
+2. **`next-auth` 4.24.15 behaves differently** in two ways. `NEXTAUTH_URL` now wins over the host Vercel detects, so check it in every environment you deploy to. And a sign in that was started before your deploy fails once at the callback, because the sign in cookies now belong to a provider. Signing in again works.
+3. **Take the tokens from `account`, not `user`.** If your `jwt` callback reads `accessToken`, `refreshToken` or `accessTokenExpires` from `user` on sign in, it still works, but that is deprecated and goes away in 1.0. Use `...toSubriteJWT(account)` as in the configuration above, and remove the token fields from your `User` augmentation so TypeScript shows what still reads them.
+4. **Move to `SubriteSession`.** The 0.2.x augmentation (`user: DefaultSession['user'] & SubriteProfile`) still compiles. `SubriteProfile` is deprecated, because the session's user never really had those token fields. Use `interface Session extends SubriteSession {}` and `session.accessToken`.
+5. **Show `session.error`.** When Subrite rejects the refresh token, the session gets `error: 'RefreshAccessTokenError'` and the user must sign in again (see [When the user must sign in again](#when-the-user-must-sign-in-again)). Coming from 0.1.x: since 0.2.0 `refreshAccessToken` never throws, so NextAuth no longer clears the session by itself. If you want that, throw from the `jwt` callback when `error` is set.
+6. **An unchanged token is not a failure.** Other errors no longer flag the session. The token comes back unchanged and is refreshed later.
+7. **`subriteUrl` is the server's origin.** A path in it is ignored, as before, and now logs a warning.
 
 ## Refreshing the access token
 

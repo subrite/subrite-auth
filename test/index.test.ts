@@ -5,6 +5,7 @@ import Subrite, {
   isAccessTokenExpired,
   refreshAccessToken,
   toSubriteJWT,
+  type RefreshParams,
 } from '../src/index.ts';
 import { captureConsole, fakeSubrite, ok, sessionToken } from './helpers.ts';
 
@@ -29,31 +30,38 @@ describe('Subrite provider', () => {
     assert.equal(provider.options?.clientId, 'id');
   });
 
-  it('keeps a path in the Subrite URL', () => {
-    for (const subriteUrl of ['https://example.com/tenant', 'https://example.com/tenant/']) {
-      const provider = Subrite({ clientId: 'id', clientSecret: 'secret', subriteUrl });
+  it('ignores a path in the Subrite URL, as 0.2.x did, and warns once', () => {
+    for (let i = 0; i < 2; i += 1) {
+      const provider = Subrite({
+        clientId: 'id',
+        clientSecret: 'secret',
+        subriteUrl: 'https://example.com/tenant',
+      });
       assert.equal(
         provider.wellKnown,
-        'https://example.com/tenant/api/oidc/.well-known/openid-configuration',
+        'https://example.com/api/oidc/.well-known/openid-configuration',
       );
     }
+    assert.equal(loggedText().match(/The path \/tenant is ignored/g)?.length, 1);
   });
 
-  it('maps the profile without any tokens', async () => {
+  it('maps the profile, and adds the tokens for apps written for 0.2.x', async () => {
     const provider = Subrite({ clientId: 'id', clientSecret: 's', subriteUrl: 'https://a.b' });
     const tokens = { access_token: 'a', refresh_token: 'r', expires_at: 1 };
+    const tokenFields = { accessToken: 'a', refreshToken: 'r', accessTokenExpires: 1000 };
     assert.deepEqual(
       await provider.profile?.(
         { sub: '1', name: 'Ada', email: 'ada@example.com', picture: 'p.png', image: 'i.png' },
         tokens,
       ),
-      { id: '1', name: 'Ada', email: 'ada@example.com', image: 'p.png' },
+      { id: '1', name: 'Ada', email: 'ada@example.com', image: 'p.png', ...tokenFields },
     );
     assert.deepEqual(await provider.profile?.({ sub: '2', image: 'i.png' }, tokens), {
       id: '2',
       name: null,
       email: null,
       image: 'i.png',
+      ...tokenFields,
     });
   });
 });
@@ -109,9 +117,9 @@ describe('generatePostSignOutUrl', () => {
     );
   });
 
-  it('keeps a path in the Subrite URL', () => {
+  it('ignores a path in the Subrite URL, as 0.2.x did', () => {
     const url = new URL(generatePostSignOutUrl('https://example.com/tenant', 'id', 'https://a.b'));
-    assert.equal(url.pathname, '/tenant/api/oidc/session/end');
+    assert.equal(url.pathname, '/api/oidc/session/end');
   });
 });
 
@@ -287,6 +295,53 @@ describe('refreshAccessToken', () => {
     } finally {
       clearTimeout(keepAlive);
     }
+  });
+
+  it('never throws, even without params', async () => {
+    const token = sessionToken();
+    const refreshed = await refreshAccessToken(token, undefined as unknown as RefreshParams);
+    assert.deepEqual(refreshed, token);
+  });
+
+  it('uses httpOptions.timeout from the config when timeoutMs is not set', async () => {
+    const subrite = fakeSubrite({
+      token: ({ signal }) =>
+        new Promise<Response>((_, reject) => {
+          signal?.addEventListener('abort', () => reject(signal.reason));
+        }),
+    });
+    const keepAlive = setTimeout(() => {}, 5000);
+    try {
+      const started = Date.now();
+      const token = sessionToken();
+      const params = { ...subrite.params, httpOptions: { timeout: 50 } };
+      assert.deepEqual(await refreshAccessToken(token, params), token);
+      assert.ok(Date.now() - started < 2000);
+      assert.match(loggedText(), /TimeoutError/);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it('releases the connection of a failed OpenID configuration request', async () => {
+    let cancelled = false;
+    const subrite = fakeSubrite({
+      discoveryResponse: () =>
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.enqueue(new TextEncoder().encode('<html>error page</html>'));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status: 500 },
+        ),
+      token: () => ok({ access_token: 'a', expires_in: 60 }),
+    });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(cancelled, true);
   });
 
   it('never throws, even with a broken timeout', async () => {

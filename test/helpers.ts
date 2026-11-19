@@ -46,6 +46,7 @@ export function fakeSubrite(options: {
   revocation?: TokenHandler;
   discovery?: Record<string, unknown>;
   discoveryStatus?: number;
+  discoveryResponse?: () => Response;
 }) {
   const subriteUrl = `https://${unique('subrite')}.example.com`;
   const discoveryUrl = `${subriteUrl}/api/oidc/.well-known/openid-configuration`;
@@ -63,6 +64,9 @@ export function fakeSubrite(options: {
     calls.redirects.push(init?.redirect);
     if (url === discoveryUrl) {
       calls.discovery += 1;
+      if (options.discoveryResponse) {
+        return Promise.resolve(options.discoveryResponse());
+      }
       if (options.discoveryStatus) {
         return Promise.resolve(new Response('nope', { status: options.discoveryStatus }));
       }

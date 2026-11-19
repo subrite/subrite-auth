@@ -9,13 +9,15 @@ import Subrite, {
 const subriteConfig = {
   clientId: 'your-client-id',
   clientSecret: 'your-client-secret',
+  // The Subrite server's origin, like https://example.subrite.no
   subriteUrl: 'your-subrite-url',
 };
 
 export const options: NextAuthOptions = {
   providers: [Subrite(subriteConfig)],
   events: {
-    // The refresh token keeps working after the user signs out of Subrite, so revoke it.
+    // The refresh token keeps working after the user signs out of Subrite, so revoke it
+    // (where Subrite supports revocation, see "Signing out" below).
     async signOut({ token }) {
       await revokeRefreshToken(token, subriteConfig);
     },
@@ -41,8 +43,9 @@ export const options: NextAuthOptions = {
     async session({ session, token }) {
       // Only needed if code in the browser calls Subrite with the access token.
       session.accessToken = token.accessToken;
-      // Lets the browser see that the user must sign in again.
-      session.error = token.error;
+      // Lets the browser see that the user must sign in again. A token that still has its refresh
+      // token is fine: 0.2.x could leave a stale error on it.
+      session.error = token.refreshToken ? undefined : token.error;
       return session;
     },
   },

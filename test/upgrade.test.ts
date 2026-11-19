@@ -132,6 +132,25 @@ describe('upgrading from 0.2.1', () => {
     await signInAndRefresh(subrite, jwt);
   });
 
+  it('works with a jwt callback that reads the tokens from user, as 0.2.x allowed', async () => {
+    const subrite = fakeSubrite({ token: newTokens });
+    const subriteConfig = { ...subrite.params };
+
+    // Some 0.2.x apps took the tokens from `user` on sign in. 0.2.x returned them from profile().
+    async function jwt({ token, user }: { token: Token; user?: unknown; account?: Account }) {
+      if (user) {
+        const { accessToken, refreshToken, accessTokenExpires } = user as SubriteJWT;
+        return { ...token, accessToken, refreshToken, accessTokenExpires };
+      }
+      if (Date.now() < token.accessTokenExpires) {
+        return token;
+      }
+      return refreshAccessToken(token, subriteConfig);
+    }
+
+    await signInAndRefresh(subrite, jwt);
+  });
+
   it('works with the jwt callback from the current README', async () => {
     const subrite = fakeSubrite({ token: newTokens });
     const subriteConfig = { ...subrite.params };
@@ -168,7 +187,6 @@ async function signInAndRefresh(subrite: ReturnType<typeof fakeSubrite>, jwt: Jw
     expires_at: nowSeconds + 30,
   };
   const user = await provider.profile?.({ sub: 'user-1', name: 'Ada' }, account);
-  assert.equal(JSON.stringify(user).includes('first-'), false, 'no tokens on the user');
 
   const signedIn = await jwt({
     token: { name: 'Ada', sub: 'user-1' } as unknown as Token,

@@ -23,28 +23,19 @@ CI runs all checks on every push to `develop` and on pull requests.
 
 ## Release process
 
-Follow these steps on `develop`, with a clean working tree.
+### In the release pull request
 
-### Update `CHANGELOG.md`
+- In `CHANGELOG.md`, give the changes under `[Unreleased]` their version heading, add a new empty
+  `[Unreleased]` section above it, and add a link for the new version at the bottom.
+- Bump the version. `preversion` runs the lint, format check, type check and tests first:
 
-- Rename the `[Unreleased]` section to the new version and today's date, and add a new empty
-  `[Unreleased]` section above it.
-- Add a link for the new version at the bottom of the file.
+      npm version X.Y.Z --no-git-tag-version
 
-Commit the change:
+### After merging
 
-    git commit -am "Update changelog for vX.Y.Z"
+On the merged commit, put the release date in the `CHANGELOG.md` heading if it is still missing,
+then tag and publish. `prepublishOnly` runs the lint, type check, tests and package check first.
 
-### Bump the version
-
-`preversion` runs the lint, format check, type check and tests first. Then this updates
-`package.json`, commits, and creates the `vX.Y.Z` tag:
-
-    npm version X.Y.Z
-    git push --follow-tags
-
-### Publish to npm
-
-`prepublishOnly` runs the lint, type check, tests and package check first.
-
+    git tag vX.Y.Z
+    git push origin vX.Y.Z
     npm publish --access public

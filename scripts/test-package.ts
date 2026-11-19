@@ -82,4 +82,26 @@ run(
   fixtures,
 );
 
+// A browser bundle that only needs generatePostSignOutUrl (like the README's sign out button)
+// must not get the refresh code.
+const { build } = await import('esbuild');
+const bundle = await build({
+  stdin: {
+    contents: `import { generatePostSignOutUrl } from '@subrite/next-auth-provider';
+      console.log(generatePostSignOutUrl('https://a.example', 'id', 'https://b.example'));`,
+    resolveDir: fixtures,
+  },
+  bundle: true,
+  minify: true,
+  platform: 'browser',
+  format: 'esm',
+  write: false,
+});
+const browserCode = bundle.outputFiles[0].text;
+console.log(`Browser bundle for generatePostSignOutUrl: ${browserCode.length} bytes`);
+const refreshCode = ['token_endpoint', '@subrite/next-auth-provider/v1', 'refresh_token'];
+if (refreshCode.some((marker) => browserCode.includes(marker))) {
+  throw new Error('The refresh code ends up in browser bundles that only sign out');
+}
+
 console.log('Package check passed');
