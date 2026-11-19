@@ -53,9 +53,9 @@ Refreshing:
 - Only `invalid_grant` from Subrite marks the session with `RefreshAccessTokenError`, and then
   `refreshToken` is an empty string. Other failures return the token unchanged, with its expired
   access token, and that refresh token is tried again after 10 seconds, doubling up to 5 minutes,
-  or when `Retry-After` says. When three different refresh tokens fail in a row, for a reason
-  other than an OAuth server error from Subrite, refreshes for the client pause for 10 seconds,
-  growing to a minute.
+  or when `Retry-After` says. When three different refresh tokens fail with no answer from Subrite
+  in between, refreshes for the client pause for 10 seconds, growing to a minute. Three broken
+  accounts failing in a quiet moment look the same, so they can hold other users up briefly.
 - The refresh reads Subrite's OpenID configuration first (once an hour per server process) and
   authenticates like the sign in, with HTTP Basic unless Subrite only supports
   `client_secret_post` or the config sets `token_endpoint_auth_method`. 0.2.x posted the client
@@ -63,8 +63,8 @@ Refreshing:
 - Refreshes are shared within a server process. A second refresh with the same refresh token
   within 30 seconds gets the same access token without asking Subrite.
 - A refresh gives up after 30 seconds (`timeoutMs`). 0.2.x waited as long as `fetch` did.
-- Log messages changed. Errors still start with `Error refreshing access token:`, now followed by
-  `{ status, error, error_description }`.
+- Log messages changed. Errors still start with `Error refreshing access token`, now followed by
+  a colon and `{ status, error, error_description }`.
 - App tests that mock `fetch` must also answer the OpenID configuration request, expect HTTP
   Basic, and call `resetRefreshState()` before each test.
 
@@ -91,7 +91,8 @@ Refreshing:
 - Public clients: with `token_endpoint_auth_method: 'none'`, or an empty client secret, the
   refresh sends only the client id.
 - `SubriteClaims`, `SubriteSession`, `SubriteTokens`, `SubriteTokenError`, `RefreshParams` and
-  `SignOutOptions` types. `subriteUrl` accepts a `URL` as well as a string.
+  `SignOutOptions` types. `RefreshParams.subriteUrl` and `generatePostSignOutUrl` accept a `URL`
+  as well as a string.
 - A warning when `subriteUrl` has a path, which is ignored as before, and an error when the
   config sets a `token_endpoint_auth_method` the refresh can't use. Each is logged once per
   process.
@@ -102,19 +103,18 @@ Refreshing:
 - In 0.2.x any failed refresh, even a network blip, set `RefreshAccessTokenError` for good. Now
   the session is only marked when Subrite rejects the refresh token. Then the rejected refresh
   token is removed and Subrite is not asked again for that session. Sessions that 0.2.x marked
-  after a temporary failure recover on the next refresh. Error values your app sets are left
-  alone.
+  with `RefreshAccessTokenError` after a temporary failure recover on the next refresh. Error
+  values your app sets are left alone.
 - Failures that are not about the token keep the session: network errors, timeouts, a response
   that breaks off or has no tokens, redirects, 5xx, 429, firewall or CDN pages, and client
   configuration errors such as `invalid_client`, `unauthorized_client` or `invalid_request`.
   That refresh token waits 10 seconds (or as long as `Retry-After` says), doubling with each
   failure in a row up to 5 minutes, so a refresh token that keeps failing only delays itself.
-  When three different refresh tokens fail for another reason (network errors, timeouts, pages
-  from a proxy, 429, 503 or client configuration errors), refreshes for that Subrite client pause
-  for 10 seconds, growing to at most a minute, and one request at a time checks whether Subrite
-  is back.
-  When Subrite answers with an OAuth server error, such as `server_error` for one account, only
-  that refresh token waits. When a check finds Subrite back, everyone refreshes right away.
+  When three different refresh tokens fail with no answer from Subrite in between (no new tokens
+  and no rejection), refreshes for that Subrite client pause for 10 seconds, growing to at most a
+  minute, and one request at a time checks whether Subrite is back. The pause does not grow for
+  `500 server_error`, which can be one account's bad data, so broken accounts add 10 seconds each
+  at most. When a check finds Subrite back, everyone refreshes right away.
 - Requests that hold the same refresh token share one refresh within a server process, also
   across the copies of the library that Next.js loads for different routers. When Subrite
   replaced the refresh token, a later request with an old cookie gets the new tokens from memory

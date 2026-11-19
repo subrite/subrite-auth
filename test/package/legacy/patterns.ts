@@ -46,12 +46,7 @@ const withRoles = Subrite({
 });
 
 export const options: NextAuthOptions = {
-  providers: [
-    withRoles,
-    Subrite(proxyConfig),
-    Subrite(signedConfig),
-    Subrite({ ...signedConfig, subriteUrl: new URL(signedConfig.subriteUrl) }),
-  ],
+  providers: [withRoles, Subrite(proxyConfig), Subrite(signedConfig)],
   callbacks: {
     async jwt({ token, account }) {
       if (account) {

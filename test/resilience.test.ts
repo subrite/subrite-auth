@@ -347,38 +347,84 @@ describe('outages', () => {
     assert.equal(subrite.calls.token.length, 7);
   });
 
-  it('server errors that Subrite answers for single accounts never pause anyone else', async () => {
+  // node-oidc-provider answers any unexpected failure with this: one account's bad data, or its
+  // storage being down.
+  const serverError = () =>
+    Response.json(
+      { error: 'server_error', error_description: 'oops! something went wrong' },
+      { status: 500 },
+    );
+
+  it('server_error from broken accounts never makes the pause grow', async () => {
     const tick = fakeClock();
     const broken = [1, 2, 3, 4, 5, 6].map(() => sessionToken());
     const brokenTokens = new Set(broken.map((token) => token.refreshToken));
-    // What node-oidc-provider answers when one account's data breaks the refresh.
     const subrite = fakeSubrite({
       token: ({ form }) =>
-        brokenTokens.has(form.get('refresh_token') ?? '')
-          ? Response.json({ error: 'server_error' }, { status: 500 })
-          : rotatingTokens(),
+        brokenTokens.has(form.get('refresh_token') ?? '') ? serverError() : rotatingTokens(),
     });
-    for (let second = 0; second < 60; second += 1) {
-      for (const token of broken) await refreshAccessToken(token, subrite.params);
-      const healthy = sessionToken();
-      assert.match((await refreshAccessToken(healthy, subrite.params)).accessToken, /^access-/);
+    // Every second the broken accounts ask first, so they win every check, then a healthy user.
+    const healthy = sessionToken();
+    let healthyRefreshedAt: number | undefined;
+    for (let second = 0; second <= 300 && healthyRefreshedAt === undefined; second += 1) {
+      for (const account of broken) await refreshAccessToken(account, subrite.params);
+      const result = await refreshAccessToken(healthy, subrite.params);
+      if (result.accessToken !== healthy.accessToken) healthyRefreshedAt = second;
       tick(1000);
     }
-    // Each broken account still backs off on its own: 10 s, 20 s, 40 s.
-    const attempts = subrite.calls.token.filter((r) =>
-      brokenTokens.has(r.form.get('refresh_token') ?? ''),
-    ).length;
-    assert.equal(attempts, broken.length * 3);
+    // The first three look like an outage (10 s). Each broken account that fails for the first
+    // time during it adds 10 s, never a doubling pause: 10 + 3 x 10 s at most.
+    assert.ok(
+      healthyRefreshedAt !== undefined && healthyRefreshedAt <= 40,
+      `got ${healthyRefreshedAt}`,
+    );
   });
 
-  it('a 503 still counts towards an outage, even with an OAuth error code', async () => {
-    fakeClock();
-    const subrite = fakeSubrite({
-      token: () => Response.json({ error: 'temporarily_unavailable' }, { status: 503 }),
-    });
+  it('when Subrite answers server_error for everyone (storage down), pauses everyone and checks every 10 s', async () => {
+    const tick = fakeClock();
+    let storageDown = true;
+    const subrite = fakeSubrite({ token: () => (storageDown ? serverError() : rotatingTokens()) });
+    const users = Array.from({ length: 50 }, () => sessionToken());
+    // 50 users ask every second for 5 minutes.
+    for (let second = 0; second < 300; second += 1) {
+      for (const user of users) await refreshAccessToken(user, subrite.params);
+      tick(1000);
+    }
+    // Three to notice, then every 10 s one check by a user who hasn't failed and one by a token
+    // that has. That stays the same however many users there are (50 users ask 15,000 times).
+    assert.ok(subrite.calls.token.length <= 3 + 2 * 30, `sent ${subrite.calls.token.length}`);
+    // Subrite recovers. Within one pause every user refreshes, none sits out a back off.
+    storageDown = false;
+    tick(10_000);
+    for (const user of users) {
+      assert.match((await refreshAccessToken(user, subrite.params)).accessToken, /^access-/);
+    }
+  });
+
+  it('a server_error does not end an outage', async () => {
+    const tick = fakeClock();
+    let respond: () => Response = down;
+    const subrite = fakeSubrite({ token: () => respond() });
     await startOutage(subrite.params);
+    tick(10_000);
+    respond = serverError;
+    await refreshAccessToken(sessionToken(), subrite.params); // the check gets server_error
+    respond = down;
     await refreshAccessToken(sessionToken(), subrite.params);
-    assert.equal(subrite.calls.token.length, 3, 'paused after three failing refresh tokens');
+    assert.equal(subrite.calls.token.length, 4, 'still paused after the server_error');
+  });
+
+  it('gateway errors count towards an outage, even with a JSON body', async () => {
+    for (const respond of [
+      () => Response.json({ error: 'temporarily_unavailable' }, { status: 503 }),
+      () => Response.json({ status: 504, error: 'Gateway Timeout' }, { status: 504 }),
+      () => Response.json({ error: 'bad_gateway' }, { status: 502 }),
+    ]) {
+      const subrite = fakeSubrite({ token: respond });
+      await startOutage(subrite.params);
+      await refreshAccessToken(sessionToken(), subrite.params);
+      assert.equal(subrite.calls.token.length, 3, 'paused after three failing refresh tokens');
+    }
   });
 
   it('a refresh token that keeps failing waits longer each time, on its own, up to 5 minutes', async () => {

@@ -275,9 +275,9 @@ When `refreshAccessToken` returns the token unchanged (the same `accessToken` an
 Nothing else signs anyone out. A network error, a timeout, a 5xx or 429, a firewall or CDN page, a response without tokens, or an error about the client configuration (such as `invalid_client` while a client secret is being fixed) leaves the token as is (still expired).
 
 - That refresh token waits 10 seconds before it is tried again (or as long as Subrite's `Retry-After` header says), doubling with each failure in a row up to 5 minutes. A refresh token that keeps failing on its own (for example because of bad data for one account) only delays itself.
-- When Subrite answers with an OAuth server error, such as `500 server_error` because of one account's data, only that refresh token waits. Other users are never paused for it.
-- When three different refresh tokens fail for any other reason (a network error, a timeout, a page from a proxy or CDN, 429, 503, or a client configuration error such as `invalid_client`) and nothing succeeds in between, Subrite is likely in trouble or the client is misconfigured. Then all refreshes for that Subrite client pause for 10 seconds, and one request at a time checks whether Subrite is back while the others keep their tokens. The pause grows only when a refresh token that had not failed yet fails too, and never past one minute (unless Subrite's `Retry-After` asks for longer). Requests that fail at the same moment count once. A check by a refresh token that already failed in the outage only holds back tokens like it.
-- As soon as a check finds Subrite back, everyone refreshes right away. That is at most a minute after Subrite recovers.
+- When three different refresh tokens fail and Subrite answers nothing in between (no new tokens and no rejection), Subrite is likely in trouble or the client is misconfigured. Then all refreshes for that Subrite client pause for 10 seconds, and one request at a time checks whether Subrite is back while the others keep their tokens. Requests that fail at the same moment count once. A check by a refresh token that already failed in the outage only holds back tokens like it.
+- The pause grows when a refresh token that had not failed yet fails too, up to one minute (unless Subrite's `Retry-After` asks for longer). It does not grow for `500 server_error`, Subrite's answer to any unexpected failure, because that can be one account's bad data. So three broken accounts failing in a quiet moment can hold other users up for 10 seconds, plus 10 seconds for each further broken account that fails for the first time during the pause.
+- As soon as a check finds Subrite back, everyone refreshes right away. That is at most a minute after Subrite recovers, plus up to 30 seconds if a check was waiting on Subrite at that moment.
 
 Configuration problems are logged with a hint, and sessions recover on their own once the configuration is fixed.
 
@@ -338,7 +338,7 @@ NextAuth waits for `events.signOut` before it signs the user out, so `revokeRefr
 Unit tests that mock `fetch` for `refreshAccessToken`, or for a `jwt` callback that calls it, must:
 
 - Answer `GET {subriteUrl}/api/oidc/.well-known/openid-configuration` with at least a `token_endpoint`. Route mocks by URL, since the configuration is cached and not requested every time.
-- Expect the client id and secret in an `Authorization: Basic` header, not in the form (unless the config sets `client_secret_post`).
+- Expect the client id and secret in an `Authorization: Basic` header, not in the form. The form is used when the config sets `token_endpoint_auth_method`, when the OpenID configuration lists only `client_secret_post`, or when the secret is empty.
 - Call `resetRefreshState()` before each test. Refresh results, back offs and the configuration are kept in memory for the whole process, and `jest.resetModules()` does not clear them.
 
 ```typescript
@@ -383,7 +383,7 @@ Most apps upgrade without code changes. Each item says who it affects.
 10. **The profile picture is filled in.** `session.user.image` now comes from Subrite's `picture` claim. 0.2.x only read `image`, so it was usually empty. If you show it with `next/image`, allow its host in `images.remotePatterns`, and in `img-src` if you have a Content Security Policy. A missing name or picture is now `null` instead of left out, so default values in destructuring and `=== undefined` checks no longer apply. To keep the 0.2.x values, override `profile` to return `{ id: claims.sub, name: claims.name, email: claims.email, image: claims.image, ...toSubriteJWT(tokens) }`.
 11. **The refresh request changed.** It first reads `/api/oidc/.well-known/openid-configuration` (once an hour per server process), then authenticates like the sign in, with HTTP Basic. 0.2.x posted the client secret in the form to `/api/oidc/token`. Firewall rules for outgoing requests must allow both.
 12. **Refreshes are shared and time out.** Requests with the same refresh token share one refresh within a server process, and a second refresh within 30 seconds gets the same access token. A refresh gives up after 30 seconds (`timeoutMs`).
-13. **Log messages changed.** Errors still start with `Error refreshing access token:`, now followed by `{ status, error, error_description }`. Configuration problems and a missing `expires_in` have messages of their own. `toSubriteJWT`'s error for a missing refresh token still starts with `No refresh_token`, but says more.
+13. **Log messages changed.** Errors still start with `Error refreshing access token`, now followed by a colon and `{ status, error, error_description }`. Configuration problems and a missing `expires_in` have messages of their own. `toSubriteJWT`'s error for a missing refresh token still starts with `No refresh_token`, but says more.
 
 ### Tests
 

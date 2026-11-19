@@ -67,7 +67,7 @@ export const cleared: SubriteJWT[] = [
 const typedConfig: SubriteConfig = {
   clientId: 'id',
   clientSecret: 'secret',
-  subriteUrl: new URL('https://a.example'),
+  subriteUrl: 'https://a.example',
   httpOptions: { timeout: 5000 },
   client: { token_endpoint_auth_method: 'client_secret_post' },
 };
@@ -77,7 +77,13 @@ export const refreshedWithConfig = refreshAccessToken(
 );
 
 // The provider keeps its options typed.
-export const providerUrl: string | URL = Subrite(typedConfig).options.subriteUrl;
+export const providerUrl: string = Subrite(typedConfig).options.subriteUrl;
+
+Subrite({
+  ...typedConfig,
+  // @ts-expect-error client metadata keeps its types: the algorithm is a string
+  client: { id_token_signed_response_alg: 5 },
+});
 
 // Only the three token fields, for apps that map over them.
 export const tokenLabels: Record<keyof SubriteTokens, string> = {

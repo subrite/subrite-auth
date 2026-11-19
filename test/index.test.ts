@@ -89,11 +89,11 @@ describe('Subrite provider', () => {
     assert.equal(await user({ sub: '1', picture: '', image: 'i.png' }), 'i.png');
   });
 
-  it('accepts public clients and URL objects, and logs other auth methods once', () => {
+  it('accepts public clients, and logs other auth methods once', () => {
     const quiet = Subrite({
       clientId: 'id',
       clientSecret: '',
-      subriteUrl: new URL('https://auth.example.com'),
+      subriteUrl: 'https://auth.example.com',
       client: { token_endpoint_auth_method: 'none' },
     });
     assert.equal(
@@ -553,5 +553,30 @@ describe('refresh sharing', () => {
     await refreshAccessToken(token, subrite.params);
     assert.equal(subrite.calls.token.length, 2);
     assert.equal(subrite.calls.discovery, 2);
+  });
+
+  it('ignores refreshes that finish after resetRefreshState', async () => {
+    // A test that ends without waiting for its refresh must not leak into the next one.
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let first = true;
+    const subrite = fakeSubrite({
+      token: async () => {
+        if (first) {
+          first = false;
+          await gate;
+        }
+        return new Response('down', { status: 503 });
+      },
+    });
+    const pending = refreshAccessToken(sessionToken(), subrite.params);
+    resetRefreshState();
+    // Two failures of this test's own. With the leaked one they would make three: an outage.
+    await refreshAccessToken(sessionToken(), subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    release();
+    await pending;
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 4, 'the third failure of this test is its own');
   });
 });

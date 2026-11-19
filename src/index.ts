@@ -53,14 +53,32 @@ export interface SubriteProfile extends SubriteJWT {
 }
 
 type UserConfig = OAuthUserConfig<SubriteClaims>;
+type ClientMetadata = NonNullable<UserConfig['client']>;
+// The named fields of openid-client's ClientMetadata. A plain Omit would keep only its index
+// signature and drop every field type.
+type NamedClientMetadata = {
+  [
+    K in keyof ClientMetadata as string extends K
+      ? never
+      : number extends K
+        ? never
+        : K extends 'token_endpoint_auth_method'
+          ? never
+          : K
+  ]: ClientMetadata[K];
+};
 
 export type SubriteConfig = Omit<UserConfig, 'client' | 'profile'> & {
   /** The Subrite server's origin, like `https://example.subrite.no`. A path is ignored. */
-  subriteUrl: string | URL;
-  /** Client metadata for the sign in. Subrite() checks `token_endpoint_auth_method` itself. */
+  subriteUrl: string;
+  /**
+   * Client metadata for the sign in. `token_endpoint_auth_method` is any string, so a plain
+   * config object compiles. Subrite() checks the value itself.
+   */
   client?:
-    | (Omit<NonNullable<UserConfig['client']>, 'token_endpoint_auth_method'> & {
+    | (NamedClientMetadata & {
         token_endpoint_auth_method?: string | undefined;
+        [key: string]: unknown;
       })
     | undefined;
   /**
@@ -135,8 +153,8 @@ const PERMANENT_FAILURE_REUSE_MS = 60 * 60 * 1000;
 const BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 // When this many different refresh tokens fail for the first time with no answer from Subrite in
-// between (new tokens, a rejection or an OAuth server error), Subrite is likely down for the
-// client, or the client is misconfigured. Its refreshes then pause the same way, but for
+// between (new tokens or a rejection), Subrite is likely down for the client, or the client is
+// misconfigured. Its refreshes then pause the same way, but for
 // at most a minute, so users get new tokens soon after Subrite is back.
 const OUTAGE_MIN_FAILING_TOKENS = 3;
 const MAX_OUTAGE_PAUSE_MS = 60_000;
@@ -242,10 +260,11 @@ type RefreshOutcome =
       kind: 'temporary-failure';
       retryAfterMs?: number;
       /**
-       * Subrite itself answered with an OAuth server error. That can be one account's problem
-       * (for example bad data), so it says nothing about other users and never pauses them.
+       * Subrite answered 500 server_error, node-oidc-provider's answer to any unexpected
+       * failure. That can be one account's bad data or Subrite's storage being down, so it
+       * counts towards an outage, but never makes the outage pause longer.
        */
-      answered?: boolean;
+      serverError?: boolean;
     };
 
 const TEMPORARY: RefreshOutcome = { kind: 'temporary-failure' };
@@ -546,6 +565,8 @@ function settle(
   outcome: RefreshOutcome,
   params: RefreshParams,
 ): void {
+  // Dropped by resetRefreshState while in progress: it belongs to a test that is over.
+  if (state.refreshes.get(key) !== entry) return;
   const now = Date.now();
   // Revoked while the request was in progress: the revocation wins.
   const revoked = entry.settled !== undefined;
@@ -558,16 +579,7 @@ function settle(
     health.probing = false;
   }
 
-  const failedBefore = entry.failures > 0;
-  if (!revoked && outcome.kind === 'temporary-failure') {
-    // This refresh token waits on its own, longer after each failure in a row. A refresh token
-    // that keeps failing (for example bad data for one account) only delays itself.
-    entry.failures += 1;
-    entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
-    entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
-  }
-
-  if (outcome.kind !== 'temporary-failure' || outcome.answered) {
+  if (outcome.kind !== 'temporary-failure') {
     // Subrite answered, so it is up. Any outage is over.
     health.lastAnswer = now;
     health.failing.clear();
@@ -575,7 +587,7 @@ function settle(
     health.step = 0;
     health.pausedUntil = 0;
     health.stalePausedUntil = 0;
-    if (revoked || outcome.kind === 'temporary-failure') return;
+    if (revoked) return;
     entry.failures = 0;
     entry.reuseUntil =
       outcome.kind === 'success'
@@ -583,6 +595,15 @@ function settle(
         : now + PERMANENT_FAILURE_REUSE_MS;
     entry.keepUntil = entry.reuseUntil;
     return;
+  }
+
+  const failedBefore = entry.failures > 0;
+  if (!revoked) {
+    // This refresh token waits on its own, longer after each failure in a row. A refresh token
+    // that keeps failing (for example bad data for one account) only delays itself.
+    entry.failures += 1;
+    entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
+    entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
   }
 
   if (!health.outage) {
@@ -614,8 +635,10 @@ function settle(
 
   entry.duringOutage = true;
   if (entry.probe && entry.freshProbe) {
-    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer.
-    health.step += 1;
+    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer,
+    // unless it was server_error, which may be that account's own problem. Then check again
+    // after a pause of the same length.
+    if (!outcome.serverError) health.step += 1;
     pause(health, now, outagePauseLength(health.step, outcome.retryAfterMs));
   } else if (entry.probe) {
     // No news from a refresh token that already failed. Only tokens like it wait again, so
@@ -857,10 +880,8 @@ async function callTokenEndpoint(
     if (retryAfterMs !== undefined) {
       failure.retryAfterMs = retryAfterMs;
     }
-    // An OAuth error from Subrite's server, not a page from a proxy in between. 503 is about
-    // load, so it still counts towards an outage.
-    if (error && response.status >= 500 && response.status !== 503) {
-      failure.answered = true;
+    if (response.status === 500 && error === 'server_error') {
+      failure.serverError = true;
     }
     return failure;
   }
@@ -1104,7 +1125,7 @@ function warnAboutPath(subriteUrl: string | URL): void {
   }
 }
 
-// AbortSignal.timeout, with a fallback for test environments without it, like jsdom before 22
+// AbortSignal.timeout, with a fallback for test environments without it, like jsdom before 22.1
 // (Jest 29's jest-environment-jsdom).
 function timeoutSignal(ms: number): AbortSignal {
   if (typeof AbortSignal.timeout === 'function') {
