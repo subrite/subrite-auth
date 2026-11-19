@@ -99,6 +99,17 @@ describe('what counts as a rejected refresh token', () => {
     await refreshAccessToken(sessionToken(), subrite.params);
     assert.match(loggedText(), /client configuration/);
   });
+
+  it('does not blame the configuration for load or server errors', async () => {
+    for (const respond of [
+      () => Response.json({ error: 'slow_down' }, { status: 429 }),
+      () => Response.json({ error: 'server_error' }, { status: 500 }),
+    ]) {
+      const subrite = fakeSubrite({ token: respond });
+      await refreshAccessToken(sessionToken(), subrite.params);
+    }
+    assert.doesNotMatch(loggedText(), /client configuration/);
+  });
 });
 
 describe('broken responses', () => {
@@ -334,6 +345,40 @@ describe('outages', () => {
       );
     }
     assert.equal(subrite.calls.token.length, 7);
+  });
+
+  it('server errors that Subrite answers for single accounts never pause anyone else', async () => {
+    const tick = fakeClock();
+    const broken = [1, 2, 3, 4, 5, 6].map(() => sessionToken());
+    const brokenTokens = new Set(broken.map((token) => token.refreshToken));
+    // What node-oidc-provider answers when one account's data breaks the refresh.
+    const subrite = fakeSubrite({
+      token: ({ form }) =>
+        brokenTokens.has(form.get('refresh_token') ?? '')
+          ? Response.json({ error: 'server_error' }, { status: 500 })
+          : rotatingTokens(),
+    });
+    for (let second = 0; second < 60; second += 1) {
+      for (const token of broken) await refreshAccessToken(token, subrite.params);
+      const healthy = sessionToken();
+      assert.match((await refreshAccessToken(healthy, subrite.params)).accessToken, /^access-/);
+      tick(1000);
+    }
+    // Each broken account still backs off on its own: 10 s, 20 s, 40 s.
+    const attempts = subrite.calls.token.filter((r) =>
+      brokenTokens.has(r.form.get('refresh_token') ?? ''),
+    ).length;
+    assert.equal(attempts, broken.length * 3);
+  });
+
+  it('a 503 still counts towards an outage, even with an OAuth error code', async () => {
+    fakeClock();
+    const subrite = fakeSubrite({
+      token: () => Response.json({ error: 'temporarily_unavailable' }, { status: 503 }),
+    });
+    await startOutage(subrite.params);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, 3, 'paused after three failing refresh tokens');
   });
 
   it('a refresh token that keeps failing waits longer each time, on its own, up to 5 minutes', async () => {

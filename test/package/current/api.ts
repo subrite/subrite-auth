@@ -4,6 +4,7 @@ import Subrite, {
   generatePostSignOutUrl,
   isAccessTokenExpired,
   refreshAccessToken,
+  resetRefreshState,
   revokeRefreshToken,
   toSubriteJWT,
   type RefreshParams,
@@ -14,6 +15,7 @@ import Subrite, {
   type SubriteProfile,
   type SubriteSession,
   type SubriteTokenError,
+  type SubriteTokens,
 } from '@subrite/next-auth-provider';
 
 // @ts-expect-error clientId is required
@@ -54,6 +56,38 @@ export const ownError: SubriteJWT = { ...fromAccount, error: 'MyOwnError' };
 
 export const claims: SubriteClaims = { sub: 'user-1' };
 
+// null and undefined clear the error, also with exactOptionalPropertyTypes.
+export const cleared: SubriteJWT[] = [
+  { ...fromAccount, error: null },
+  { ...fromAccount, error: undefined },
+];
+
+// A config typed SubriteConfig goes to refreshAccessToken as it is, with the options NextAuth
+// knows (also with exactOptionalPropertyTypes).
+const typedConfig: SubriteConfig = {
+  clientId: 'id',
+  clientSecret: 'secret',
+  subriteUrl: new URL('https://a.example'),
+  httpOptions: { timeout: 5000 },
+  client: { token_endpoint_auth_method: 'client_secret_post' },
+};
+export const refreshedWithConfig = refreshAccessToken(
+  { ...fromAccount, error: undefined },
+  typedConfig,
+);
+
+// The provider keeps its options typed.
+export const providerUrl: string | URL = Subrite(typedConfig).options.subriteUrl;
+
+// Only the three token fields, for apps that map over them.
+export const tokenLabels: Record<keyof SubriteTokens, string> = {
+  accessToken: 'Access token',
+  refreshToken: 'Refresh token',
+  accessTokenExpires: 'Expires',
+};
+
+export const reset: () => void = resetRefreshState;
+
 export const values = { notANumber, refreshAccessToken, toSubriteJWT };
 export type Types = [
   RefreshParams,
@@ -63,4 +97,5 @@ export type Types = [
   SubriteProfile,
   SubriteSession,
   SubriteTokenError,
+  SubriteTokens,
 ];

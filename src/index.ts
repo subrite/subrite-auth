@@ -1,28 +1,32 @@
-import type { TokenSet, User } from 'next-auth';
+import type { Awaitable, TokenSet, User } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import type { OAuthConfig, OAuthUserConfig } from 'next-auth/providers/oauth';
 
 /** The value of `error` when Subrite rejected the refresh token. The user must sign in again. */
 export type SubriteTokenError = 'RefreshAccessTokenError';
 
-/** The Subrite tokens kept in the NextAuth JWT. */
-export interface SubriteJWT {
+/** The Subrite tokens, as `toSubriteJWT` returns them. */
+export interface SubriteTokens {
   accessToken: string;
   /** Empty once Subrite has rejected it. */
   refreshToken: string;
   /** When the access token expires, in milliseconds since epoch. Easy to compare with `Date.now()`. */
   accessTokenExpires: number;
+}
+
+/** The Subrite tokens kept in the NextAuth JWT. */
+export interface SubriteJWT extends SubriteTokens {
   /**
    * `'RefreshAccessTokenError'` when Subrite rejected the refresh token and the user must sign in
    * again. The library leaves other values your app sets alone.
    */
-  error?: SubriteTokenError | (string & {});
+  error?: SubriteTokenError | (string & {}) | null | undefined;
 }
 
 /** Properties to add to the NextAuth session. See the README for how to wire them up. */
 export interface SubriteSession {
   accessToken?: string | undefined;
-  error?: SubriteTokenError | (string & {}) | undefined;
+  error?: SubriteTokenError | (string & {}) | null | undefined;
 }
 
 /** The claims Subrite returns about the signed in user. */
@@ -48,9 +52,22 @@ export interface SubriteProfile extends SubriteJWT {
   image: string;
 }
 
-export type SubriteConfig = OAuthUserConfig<SubriteClaims> & {
+type UserConfig = OAuthUserConfig<SubriteClaims>;
+
+export type SubriteConfig = Omit<UserConfig, 'client' | 'profile'> & {
   /** The Subrite server's origin, like `https://example.subrite.no`. A path is ignored. */
-  subriteUrl: string;
+  subriteUrl: string | URL;
+  /** Client metadata for the sign in. Subrite() checks `token_endpoint_auth_method` itself. */
+  client?:
+    | (Omit<NonNullable<UserConfig['client']>, 'token_endpoint_auth_method'> & {
+        token_endpoint_auth_method?: string | undefined;
+      })
+    | undefined;
+  /**
+   * Replaces the default profile mapping. A method, so overrides written for 0.2.x with a
+   * `SubriteProfile` parameter still compile.
+   */
+  profile?(profile: SubriteClaims, tokens: TokenSet): Awaitable<User>;
 };
 
 export type RefreshParams = {
@@ -61,17 +78,19 @@ export type RefreshParams = {
    * Only `token_endpoint_auth_method` is used. Set it if you also set it in the provider config,
    * so the refresh request authenticates the same way as the sign in.
    */
-  client?: { token_endpoint_auth_method?: string };
+  client?: { token_endpoint_auth_method?: string | undefined; [key: string]: unknown } | undefined;
   /**
-   * Only `timeout` is used, as the default for `timeoutMs`. An `agent` is not used: refreshes go
-   * through the global `fetch`.
+   * Not used. Allowed so you can pass the provider config. NextAuth's `httpOptions.timeout` is for
+   * the sign in, and refreshes go through the global `fetch`. Set `timeoutMs` instead.
    */
-  httpOptions?: { timeout?: number };
+  httpOptions?: { [key: string]: unknown } | undefined;
   /**
-   * How long to wait for Subrite before giving up. Defaults to `httpOptions.timeout`, or 10
-   * seconds (3 seconds for `revokeRefreshToken`, which runs while the user waits to sign out).
+   * How long to wait for Subrite before giving up. Defaults to 30 seconds (3 seconds for
+   * `revokeRefreshToken`, which runs while the user waits to sign out). Giving up on a refresh
+   * that Subrite already handled can cost the user the session when Subrite replaces refresh
+   * tokens, so don't set it much lower.
    */
-  timeoutMs?: number;
+  timeoutMs?: number | undefined;
   /**
    * When Subrite replaces the refresh token, how long a request that still carries the old one
    * (an old cookie) gets the new tokens from memory instead of sending the old token again.
@@ -82,7 +101,7 @@ export type RefreshParams = {
    * later is then sent to Subrite, whose reuse detection can end the stolen session. It can only
    * shorten the default. Longer values have no effect.
    */
-  oldCookieGraceSeconds?: number;
+  oldCookieGraceSeconds?: number | undefined;
 };
 
 export type SignOutOptions = {
@@ -90,17 +109,20 @@ export type SignOutOptions = {
    * Subrite sends this back to `postLogoutRedirectUri`. Check it there before signing the user
    * out of the app, so other sites can't sign your users out by linking to that page.
    */
-  state?: string;
+  state?: string | undefined;
   /** The ID token from the sign in, if you keep it. Lets Subrite skip asking the user to confirm. */
-  idTokenHint?: string;
+  idTokenHint?: string | undefined;
 };
 
 const WELL_KNOWN_PATH = 'api/oidc/.well-known/openid-configuration';
 const SIGN_OUT_PATH = 'api/oidc/session/end';
 const REFRESH_ERROR: SubriteTokenError = 'RefreshAccessTokenError';
-const SUPPORTED_AUTH_METHODS = ['client_secret_basic', 'client_secret_post'];
+const SUPPORTED_AUTH_METHODS = ['client_secret_basic', 'client_secret_post', 'none'];
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+// Generous: when Subrite replaces refresh tokens, a refresh given up after Subrite handled it
+// leaves the session with a used refresh token. Still well below fetch's own 300 seconds.
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DISCOVERY_TIMEOUT_MS = 10_000;
 // Revocation is best effort, and NextAuth waits for it before it signs the user out.
 const DEFAULT_REVOKE_TIMEOUT_MS = 3_000;
 const DEFAULT_EXPIRY_MARGIN_SECONDS = 60;
@@ -113,7 +135,8 @@ const PERMANENT_FAILURE_REUSE_MS = 60 * 60 * 1000;
 const BACKOFF_MS = 10_000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
 // When this many different refresh tokens fail for the first time with no answer from Subrite in
-// between, Subrite is likely down for the client. Its refreshes then pause the same way, but for
+// between (new tokens, a rejection or an OAuth server error), Subrite is likely down for the
+// client, or the client is misconfigured. Its refreshes then pause the same way, but for
 // at most a minute, so users get new tokens soon after Subrite is back.
 const OUTAGE_MIN_FAILING_TOKENS = 3;
 const MAX_OUTAGE_PAUSE_MS = 60_000;
@@ -126,13 +149,17 @@ const MAX_REFRESH_ENTRIES = 10_000;
 const PRUNE_INTERVAL_MS = 10_000;
 const DISCOVERY_CACHE_MS = 60 * 60 * 1000;
 
-export default function Subrite(config: SubriteConfig): OAuthConfig<SubriteClaims> {
+export default function Subrite(
+  config: SubriteConfig,
+): OAuthConfig<SubriteClaims> & { options: SubriteConfig } {
   warnAboutPath(config.subriteUrl);
   const authMethod = config.client?.token_endpoint_auth_method;
   if (authMethod !== undefined && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
-    console.error(
+    logOnce(
+      `auth-method:${authMethod}`,
       `Subrite: token_endpoint_auth_method ${authMethod} works for sign in, but ` +
-        'refreshAccessToken only supports client_secret_basic and client_secret_post.',
+        'refreshAccessToken only supports client_secret_basic, client_secret_post and none.',
+      'error',
     );
   }
   return {
@@ -140,33 +167,35 @@ export default function Subrite(config: SubriteConfig): OAuthConfig<SubriteClaim
     name: 'Subrite',
     type: 'oauth',
     version: '2.0',
+    // NextAuth validates the ID token and reads the profile from its claims, as it does for any
+    // `wellKnown` OpenID configuration.
     wellKnown: subriteEndpoint(config.subriteUrl, WELL_KNOWN_PATH),
-    // NextAuth turns this on for any `wellKnown` OpenID configuration. Set explicitly for clarity:
-    // the ID token is validated and the profile is read from its claims.
-    idToken: true,
     checks: ['pkce', 'state'],
     authorization: {
       params: {
         scope: 'openid offline_access',
       },
     },
-    profile(profile, tokens): User & SubriteJWT {
+    // Async, as in 0.2.x, so code that chains .then() on it keeps working.
+    async profile(profile, tokens): Promise<User & SubriteJWT> {
       return {
         id: profile.sub,
         name: profile.name ?? null,
         email: profile.email ?? null,
-        image: profile.picture ?? profile.image ?? null,
+        // An empty claim counts as missing, so the app's placeholder picture still shows.
+        image: profile.picture || profile.image || null,
         // Deprecated, kept for apps written for 0.2.x whose jwt callback reads the tokens from
         // `user` on sign in. Read them from `account` with toSubriteJWT instead.
         ...toSubriteJWT(tokens),
       };
     },
-    options: config,
+    // NextAuth reads these as OAuthUserConfig. Subrite() itself checks the auth method above.
+    options: config as SubriteConfig & UserConfig,
   };
 }
 
 /** Picks the Subrite tokens out of the `account` NextAuth passes to the `jwt` callback on sign in. */
-export function toSubriteJWT(tokens: TokenSet): SubriteJWT {
+export function toSubriteJWT(tokens: TokenSet): SubriteTokens {
   const { access_token, refresh_token, expires_at } = tokens;
   if (!access_token) {
     throw new Error('No access_token');
@@ -209,7 +238,15 @@ export function isAccessTokenExpired(
 type RefreshOutcome =
   | { kind: 'success'; accessToken: string; refreshToken: string; accessTokenExpires: number }
   | { kind: 'permanent-failure' }
-  | { kind: 'temporary-failure'; retryAfterMs?: number };
+  | {
+      kind: 'temporary-failure';
+      retryAfterMs?: number;
+      /**
+       * Subrite itself answered with an OAuth server error. That can be one account's problem
+       * (for example bad data), so it says nothing about other users and never pauses them.
+       */
+      answered?: boolean;
+    };
 
 const TEMPORARY: RefreshOutcome = { kind: 'temporary-failure' };
 const PERMANENT: RefreshOutcome = { kind: 'permanent-failure' };
@@ -334,7 +371,10 @@ async function refresh(token: JWT & SubriteJWT, params: RefreshParams): Promise<
         refreshToken: outcome.refreshToken,
         accessTokenExpires: outcome.accessTokenExpires,
       };
-      delete refreshed.error;
+      // Only the library's own flag. Values the app sets are the app's.
+      if (refreshed.error === REFRESH_ERROR) {
+        delete refreshed.error;
+      }
       return refreshed;
     }
     case 'permanent-failure':
@@ -363,7 +403,7 @@ export async function revokeRefreshToken(
       return false;
     }
     forgetRefreshToken(refreshToken, params);
-    const signal = AbortSignal.timeout(timeoutOf(params, DEFAULT_REVOKE_TIMEOUT_MS));
+    const signal = timeoutSignal(params.timeoutMs ?? DEFAULT_REVOKE_TIMEOUT_MS);
     const discovery = await discover(params, signal);
     const endpoint = readString(discovery, 'revocation_endpoint');
     if (!endpoint) {
@@ -518,7 +558,16 @@ function settle(
     health.probing = false;
   }
 
-  if (outcome.kind !== 'temporary-failure') {
+  const failedBefore = entry.failures > 0;
+  if (!revoked && outcome.kind === 'temporary-failure') {
+    // This refresh token waits on its own, longer after each failure in a row. A refresh token
+    // that keeps failing (for example bad data for one account) only delays itself.
+    entry.failures += 1;
+    entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
+    entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
+  }
+
+  if (outcome.kind !== 'temporary-failure' || outcome.answered) {
     // Subrite answered, so it is up. Any outage is over.
     health.lastAnswer = now;
     health.failing.clear();
@@ -526,7 +575,7 @@ function settle(
     health.step = 0;
     health.pausedUntil = 0;
     health.stalePausedUntil = 0;
-    if (revoked) return;
+    if (revoked || outcome.kind === 'temporary-failure') return;
     entry.failures = 0;
     entry.reuseUntil =
       outcome.kind === 'success'
@@ -534,15 +583,6 @@ function settle(
         : now + PERMANENT_FAILURE_REUSE_MS;
     entry.keepUntil = entry.reuseUntil;
     return;
-  }
-
-  const failedBefore = entry.failures > 0;
-  if (!revoked) {
-    // This refresh token waits on its own, longer after each failure in a row. A refresh token
-    // that keeps failing (for example bad data for one account) only delays itself.
-    entry.failures += 1;
-    entry.reuseUntil = now + pauseLength(entry.failures, outcome.retryAfterMs);
-    entry.keepUntil = Math.max(entry.reuseUntil, now + FAILURE_MEMORY_MS);
   }
 
   if (!health.outage) {
@@ -608,8 +648,6 @@ function pauseLength(step: number, retryAfterMs: number | undefined): number {
   return Math.min(Math.max(wanted, BACKOFF_MS), MAX_BACKOFF_MS);
 }
 
-let warnedAboutGrace = false;
-
 function successReuseUntil(
   entry: RefreshEntry,
   outcome: Extract<RefreshOutcome, { kind: 'success' }>,
@@ -630,10 +668,11 @@ function successReuseUntil(
     if (Number.isFinite(grace)) {
       // The setting can only shorten the window, and never below 30 s.
       until = Math.min(until, now + Math.max(grace * 1000, MIN_SUCCESS_REUSE_MS));
-    } else if (!warnedAboutGrace) {
-      warnedAboutGrace = true;
-      console.error(
+    } else {
+      logOnce(
+        'grace',
         'Subrite: oldCookieGraceSeconds must be a number of seconds. Using the default.',
+        'error',
       );
     }
   }
@@ -750,7 +789,7 @@ async function callTokenEndpoint(
 ): Promise<RefreshOutcome> {
   let response: Response;
   try {
-    const signal = AbortSignal.timeout(timeoutOf(params, DEFAULT_TIMEOUT_MS));
+    const signal = timeoutSignal(params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const discovery = await discover(params, signal);
     const request = authenticatedForm(discovery, params);
     if (!request) {
@@ -804,7 +843,7 @@ async function callTokenEndpoint(
     if (isRejection(response.status, error)) {
       return PERMANENT;
     }
-    if (error && response.status >= 400 && response.status < 500) {
+    if (error && CLIENT_ERRORS.includes(error)) {
       console.error(
         `Subrite answered ${error}, which points to the client configuration (client id, ` +
           'secret, or allowed grants). Sessions are kept and refreshed once it is fixed.',
@@ -813,8 +852,17 @@ async function callTokenEndpoint(
     if (response.status >= 300 && response.status < 400) {
       console.error('Subrite redirected the token request. The redirect was not followed.');
     }
+    const failure: RefreshOutcome = { kind: 'temporary-failure' };
     const retryAfterMs = readRetryAfter(response);
-    return retryAfterMs === undefined ? TEMPORARY : { kind: 'temporary-failure', retryAfterMs };
+    if (retryAfterMs !== undefined) {
+      failure.retryAfterMs = retryAfterMs;
+    }
+    // An OAuth error from Subrite's server, not a page from a proxy in between. 503 is about
+    // load, so it still counts towards an outage.
+    if (error && response.status >= 500 && response.status !== 503) {
+      failure.answered = true;
+    }
+    return failure;
   }
 
   const accessToken = readString(body, 'access_token');
@@ -829,7 +877,7 @@ async function callTokenEndpoint(
   let expiresIn = readExpiresIn(body);
   if (expiresIn === undefined) {
     // Keep the new tokens: Subrite may already have replaced the old refresh token.
-    console.error(
+    console.warn(
       `Subrite sent no valid expires_in. Assuming the access token lasts ${FALLBACK_EXPIRES_IN_SECONDS} seconds.`,
     );
     expiresIn = FALLBACK_EXPIRES_IN_SECONDS;
@@ -853,6 +901,15 @@ function isRejection(status: number, error: string | undefined): boolean {
   return status >= 400 && status < 500 && error === 'invalid_grant';
 }
 
+// RFC 6749 section 5.2 error codes about the client or the request rather than the token.
+const CLIENT_ERRORS = [
+  'invalid_client',
+  'unauthorized_client',
+  'invalid_request',
+  'unsupported_grant_type',
+  'invalid_scope',
+];
+
 // Retry-After is either a number of seconds or an HTTP date (RFC 9110 section 10.2.3).
 function readRetryAfter(response: Response): number | undefined {
   const value = response.headers.get('retry-after')?.trim();
@@ -865,12 +922,15 @@ function readRetryAfter(response: Response): number | undefined {
 type AuthenticatedForm = { headers: Record<string, string>; form: URLSearchParams };
 
 // Same choice as openid-client, which NextAuth uses for the sign in: HTTP Basic unless Subrite
-// says it only supports client_secret_post. The config can choose explicitly.
+// says it only supports client_secret_post. The config can choose explicitly. Without a secret
+// the client is public (`none`) and only sends its id, as 0.2.x effectively did.
 function authenticatedForm(
   discovery: Discovery,
   params: RefreshParams,
 ): AuthenticatedForm | undefined {
-  const method = params.client?.token_endpoint_auth_method ?? defaultAuthMethod(discovery);
+  const method =
+    params.client?.token_endpoint_auth_method ??
+    (params.clientSecret ? defaultAuthMethod(discovery) : 'none');
   const headers: Record<string, string> = {
     'Content-Type': 'application/x-www-form-urlencoded',
     Accept: 'application/json',
@@ -881,10 +941,14 @@ function authenticatedForm(
   } else if (method === 'client_secret_post') {
     form.append('client_id', params.clientId);
     form.append('client_secret', params.clientSecret);
+  } else if (method === 'none') {
+    form.append('client_id', params.clientId);
   } else {
-    console.error(
-      `Subrite: token_endpoint_auth_method ${method} is not supported. Use client_secret_basic ` +
-        'or client_secret_post.',
+    logOnce(
+      `unsupported-method:${method}:${clientKeyOf(params)}`,
+      `Subrite: token_endpoint_auth_method ${method} is not supported. Use client_secret_basic, ` +
+        'client_secret_post or none.',
+      'error',
     );
     return undefined;
   }
@@ -911,10 +975,10 @@ function discover(params: RefreshParams, signal: AbortSignal): Promise<Discovery
   if (cached && cached.expires > Date.now()) {
     return untilAborted(cached.document, signal);
   }
-  const timeoutMs = Math.max(params.timeoutMs ?? DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const timeoutMs = Math.max(params.timeoutMs ?? 0, DISCOVERY_TIMEOUT_MS);
   const document = fetch(url, {
     headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: timeoutSignal(timeoutMs),
     redirect: 'manual',
   }).then(async (response) => {
     if (!response.ok) {
@@ -1008,11 +1072,13 @@ export function generatePostSignOutUrl(
   subriteSignoutUrl.searchParams.append('client_id', clientId);
   // Tell subrite where to send the user agent after signing out
   subriteSignoutUrl.searchParams.append('post_logout_redirect_uri', postLogoutRedirectUri);
-  if (options.state) {
-    subriteSignoutUrl.searchParams.append('state', options.state);
+  // JavaScript callers may pass null.
+  const { state, idTokenHint } = options ?? {};
+  if (state) {
+    subriteSignoutUrl.searchParams.append('state', state);
   }
-  if (options.idTokenHint) {
-    subriteSignoutUrl.searchParams.append('id_token_hint', options.idTokenHint);
+  if (idTokenHint) {
+    subriteSignoutUrl.searchParams.append('id_token_hint', idTokenHint);
   }
   return subriteSignoutUrl.toString();
 }
@@ -1038,14 +1104,42 @@ function warnAboutPath(subriteUrl: string | URL): void {
   }
 }
 
-function timeoutOf(params: RefreshParams, fallback: number): number {
-  return params.timeoutMs ?? params.httpOptions?.timeout ?? fallback;
+// AbortSignal.timeout, with a fallback for test environments without it, like jsdom before 22
+// (Jest 29's jest-environment-jsdom).
+function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal.timeout === 'function') {
+    return AbortSignal.timeout(ms);
+  }
+  const controller = new AbortController();
+  const timer: unknown = setTimeout(() => {
+    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+  }, ms);
+  (timer as { unref?: () => void }).unref?.();
+  return controller.signal;
 }
 
-const warned = new Set<string>();
+// Messages logged once per process, also across the copies of the library Next.js loads.
+const logged = /* @__PURE__ */ processWide('logged', () => new Set<string>());
+
+function logOnce(key: string, message: string, level: 'warn' | 'error' = 'warn'): void {
+  if (logged.has(key)) return;
+  logged.add(key);
+  console[level](message);
+}
 
 function warnOnce(key: string, message: string): void {
-  if (warned.has(key)) return;
-  warned.add(key);
-  console.warn(message);
+  logOnce(key, message);
+}
+
+/**
+ * Clears what the library keeps in memory: shared refresh results, backoff and outage state, the
+ * cached OpenID configuration, and which warnings were logged. For tests, so each test starts
+ * fresh. An app never needs it.
+ */
+export function resetRefreshState(): void {
+  state.refreshes.clear();
+  state.clients.clear();
+  state.lastPrune = 0;
+  discoveryCache.clear();
+  logged.clear();
 }

@@ -4,10 +4,11 @@ import Subrite, {
   generatePostSignOutUrl,
   isAccessTokenExpired,
   refreshAccessToken,
+  resetRefreshState,
   toSubriteJWT,
   type RefreshParams,
 } from '../src/index.ts';
-import { captureConsole, fakeSubrite, ok, sessionToken } from './helpers.ts';
+import { captureConsole, fakeSubrite, ok, sessionToken, unique } from './helpers.ts';
 
 const loggedText = captureConsole();
 
@@ -24,7 +25,9 @@ describe('Subrite provider', () => {
       provider.wellKnown,
       'https://auth.example.com/api/oidc/.well-known/openid-configuration',
     );
-    assert.equal(provider.idToken, true);
+    // NextAuth turns it on for a wellKnown configuration. Left out, as in 0.2.x, so the
+    // provider object stays the same for snapshot tests.
+    assert.equal('idToken' in provider, false);
     assert.deepEqual(provider.checks, ['pkce', 'state']);
     assert.deepEqual(provider.authorization, { params: { scope: 'openid offline_access' } });
     assert.equal(provider.options?.clientId, 'id');
@@ -63,6 +66,51 @@ describe('Subrite provider', () => {
       image: 'i.png',
       ...tokenFields,
     });
+  });
+
+  it('returns a promise from profile(), as 0.2.x did', async () => {
+    const provider = Subrite({ clientId: 'id', clientSecret: 's', subriteUrl: 'https://a.b' });
+    const tokens = { access_token: 'a', refresh_token: 'r', expires_at: 1 };
+    const result = provider.profile?.({ sub: '1' }, tokens);
+    assert.ok(result instanceof Promise);
+    await result;
+    // A missing refresh token rejects instead of throwing.
+    const failing = provider.profile?.({ sub: '1' }, { access_token: 'a', expires_at: 1 });
+    assert.ok(failing instanceof Promise);
+    await assert.rejects(Promise.resolve(failing), /No refresh_token/);
+  });
+
+  it('treats an empty picture claim as missing', async () => {
+    const provider = Subrite({ clientId: 'id', clientSecret: 's', subriteUrl: 'https://a.b' });
+    const tokens = { access_token: 'a', refresh_token: 'r', expires_at: 1 };
+    const user = (claims: { sub: string; picture?: string; image?: string }) =>
+      Promise.resolve(provider.profile?.(claims, tokens)).then((u) => u?.image);
+    assert.equal(await user({ sub: '1', picture: '' }), null);
+    assert.equal(await user({ sub: '1', picture: '', image: 'i.png' }), 'i.png');
+  });
+
+  it('accepts public clients and URL objects, and logs other auth methods once', () => {
+    const quiet = Subrite({
+      clientId: 'id',
+      clientSecret: '',
+      subriteUrl: new URL('https://auth.example.com'),
+      client: { token_endpoint_auth_method: 'none' },
+    });
+    assert.equal(
+      quiet.wellKnown,
+      'https://auth.example.com/api/oidc/.well-known/openid-configuration',
+    );
+    assert.equal(quiet.options.clientId, 'id');
+    assert.equal(loggedText(), '');
+    for (let i = 0; i < 3; i += 1) {
+      Subrite({
+        clientId: 'id',
+        clientSecret: 's',
+        subriteUrl: 'https://auth.example.com',
+        client: { token_endpoint_auth_method: 'private_key_jwt' },
+      });
+    }
+    assert.equal(loggedText().match(/private_key_jwt works for sign in/g)?.length, 1);
   });
 });
 
@@ -121,6 +169,11 @@ describe('generatePostSignOutUrl', () => {
     const url = new URL(generatePostSignOutUrl('https://example.com/tenant', 'id', 'https://a.b'));
     assert.equal(url.pathname, '/api/oidc/session/end');
   });
+
+  it('accepts null options from JavaScript callers', () => {
+    const url = generatePostSignOutUrl('https://a.b', 'id', 'https://c.d', null as never);
+    assert.match(url, /client_id=id/);
+  });
 });
 
 describe('refreshAccessToken', () => {
@@ -173,6 +226,24 @@ describe('refreshAccessToken', () => {
     assert.equal(request.form.get('client_secret'), 's3cret:+');
   });
 
+  it('sends only the client id for a public client', async () => {
+    const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
+    await refreshAccessToken(sessionToken(), {
+      ...subrite.params,
+      clientSecret: '',
+      client: { token_endpoint_auth_method: 'none' },
+    });
+    // Without a secret and without a method, as apps passed it to 0.2.x.
+    await refreshAccessToken(sessionToken(), { ...subrite.params, clientSecret: '' });
+    assert.equal(subrite.calls.token.length, 2);
+    for (const request of subrite.calls.token) {
+      assert.equal(request.headers.get('authorization'), null);
+      assert.equal(request.form.get('client_id'), 'client id');
+      assert.equal(request.form.has('client_secret'), false);
+    }
+    assert.equal(loggedText(), '');
+  });
+
   it('keeps the session when token_endpoint_auth_method is not supported', async () => {
     const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
     const token = sessionToken();
@@ -183,6 +254,22 @@ describe('refreshAccessToken', () => {
     assert.deepEqual(refreshed, token, 'a configuration problem never signs users out');
     assert.equal(subrite.calls.token.length, 0);
     assert.match(loggedText(), /private_key_jwt is not supported/);
+  });
+
+  it('removes its own error on success, and leaves values the app set alone', async () => {
+    const subrite = fakeSubrite({
+      token: () => ok({ access_token: unique('access'), expires_in: 60 }),
+    });
+    const flagged = await refreshAccessToken(
+      sessionToken({ error: 'RefreshAccessTokenError' }),
+      subrite.params,
+    );
+    assert.equal('error' in flagged, false);
+    const own = await refreshAccessToken(
+      sessionToken({ error: 'SubscriptionEnded' }),
+      subrite.params,
+    );
+    assert.equal(own.error, 'SubscriptionEnded');
   });
 
   it('keeps the old refresh token when Subrite does not send a new one', async () => {
@@ -303,23 +390,52 @@ describe('refreshAccessToken', () => {
     assert.deepEqual(refreshed, token);
   });
 
-  it('uses httpOptions.timeout from the config when timeoutMs is not set', async () => {
+  it('ignores httpOptions.timeout, which NextAuth uses for the sign in', async () => {
     const subrite = fakeSubrite({
-      token: ({ signal }) =>
-        new Promise<Response>((_, reject) => {
-          signal?.addEventListener('abort', () => reject(signal.reason));
-        }),
+      token: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        return ok({ access_token: 'slow-but-fine', expires_in: 60 });
+      },
     });
+    const params = { ...subrite.params, httpOptions: { timeout: 50 } };
+    const refreshed = await refreshAccessToken(sessionToken(), params);
+    assert.equal(refreshed.accessToken, 'slow-but-fine');
+  });
+
+  it('waits 30 s for the token endpoint and 10 s for the OpenID configuration by default', async () => {
+    const waits: number[] = [];
+    const original = AbortSignal.timeout.bind(AbortSignal);
+    mock.method(AbortSignal, 'timeout', (ms: number) => {
+      waits.push(ms);
+      return original(ms);
+    });
+    const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.deepEqual(waits.sort(), [10_000, 30_000]);
+  });
+
+  it('still times out where AbortSignal.timeout is missing, like jsdom before 22', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout');
+    Object.defineProperty(AbortSignal, 'timeout', { value: undefined, configurable: true });
     const keepAlive = setTimeout(() => {}, 5000);
     try {
-      const started = Date.now();
+      const subrite = fakeSubrite({
+        token: ({ signal }) =>
+          new Promise<Response>((_, reject) => {
+            signal?.addEventListener('abort', () => reject(signal.reason));
+          }),
+      });
       const token = sessionToken();
-      const params = { ...subrite.params, httpOptions: { timeout: 50 } };
-      assert.deepEqual(await refreshAccessToken(token, params), token);
+      const started = Date.now();
+      assert.deepEqual(
+        await refreshAccessToken(token, { ...subrite.params, timeoutMs: 50 }),
+        token,
+      );
       assert.ok(Date.now() - started < 2000);
       assert.match(loggedText(), /TimeoutError/);
     } finally {
       clearTimeout(keepAlive);
+      if (descriptor) Object.defineProperty(AbortSignal, 'timeout', descriptor);
     }
   });
 
@@ -424,5 +540,18 @@ describe('refresh sharing', () => {
     });
     assert.equal((await refreshAccessToken(token, second.params)).accessToken, 'from-second');
     assert.equal(second.calls.token.length, 1);
+  });
+
+  it('starts over after resetRefreshState, so app tests can reuse a refresh token', async () => {
+    const subrite = fakeSubrite({ token: () => ok({ access_token: unique('a'), expires_in: 60 }) });
+    const token = sessionToken();
+    await refreshAccessToken(token, subrite.params);
+    await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 1);
+    assert.equal(subrite.calls.discovery, 1);
+    resetRefreshState();
+    await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 2);
+    assert.equal(subrite.calls.discovery, 2);
   });
 });

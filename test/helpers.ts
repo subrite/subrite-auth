@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, mock } from 'node:test';
 import { inspect } from 'node:util';
-import type { RefreshParams, SubriteJWT } from '../src/index.ts';
+import { resetRefreshState, type RefreshParams, type SubriteJWT } from '../src/index.ts';
 
 let counter = 0;
 export function unique(prefix: string): string {
@@ -120,13 +120,7 @@ export function libraryState(): LibraryState {
 
 /** Starts every test from empty caches, so no test depends on another. */
 export function resetLibraryState(): void {
-  const state = libraryState();
-  if (state) {
-    state.refreshes.clear();
-    state.clients.clear();
-    state.lastPrune = 0;
-  }
-  (store[Symbol.for('@subrite/next-auth-provider/v1/discovery')] as Map<unknown, unknown>)?.clear();
+  resetRefreshState();
 }
 
 /**
