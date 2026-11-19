@@ -15,6 +15,7 @@ import Subrite, {
   type SubriteJWT,
   type SubriteProfile,
   type SubriteProvider,
+  type SubriteProviderLike,
   type SubriteSession,
   type SubriteTokenError,
   type SubriteTokens,
@@ -82,6 +83,9 @@ export const refreshedWithConfig = refreshAccessToken(
 // The provider keeps its options typed.
 export const providerUrl: string = Subrite(typedConfig).options.subriteUrl;
 export const provider: SubriteProvider = Subrite(typedConfig);
+// Subrite passed as a value gets the signature for test doubles, with `options` optional.
+export const mapped: SubriteProviderLike[] = [typedConfig].map(Subrite);
+export const mappedUrls: Array<string | undefined> = mapped.map((p) => p.options?.subriteUrl);
 
 // An untyped override that returns missing claims as undefined compiled with 0.2.1 under node10,
 // also with exactOptionalPropertyTypes. So does the README's override that keeps the 0.2.x values.
@@ -127,6 +131,8 @@ export type Types = [
   SubriteConfig,
   SubriteJWT,
   SubriteProfile,
+  SubriteProvider,
+  SubriteProviderLike,
   SubriteSession,
   SubriteTokenError,
   SubriteTokens,

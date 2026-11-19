@@ -24,8 +24,9 @@ Installing:
   warn, and so does npm when the provider comes in through another package. Apps that depend on
   `nodemailer` must move to nodemailer 7 (`^7.0.7`) in the same install, or npm fails with
   `ERESOLVE`. `next-auth` 4.24.15 changes two things itself: `NEXTAUTH_URL` now wins over the host
-  from the request headers (used on Vercel and with `AUTH_TRUST_HOST`), and a sign in started
-  before the deploy fails once at the callback.
+  from the request headers (used on Vercel and with `AUTH_TRUST_HOST`), so a deployment that
+  serves several domains, or Vercel previews, must leave it unset. And a sign in started before
+  the deploy fails once at the callback.
 
 TypeScript:
 
@@ -39,7 +40,9 @@ TypeScript:
   value in `token.error`, `error?: unknown` in a `JWT` augmentation, and `keyof SubriteJWT` no
   longer fit. `SubriteTokens` has only the three token fields. Tests that call
   `provider.profile()` pass only the claims. `Parameters<typeof refreshAccessToken>[1]` has a
-  `subriteUrl` that may be a `URL`.
+  `subriteUrl` that may be a `URL`. `style` read back from a config typed `SubriteConfig` may be
+  partial. With `exactOptionalPropertyTypes`, calling a `SubriteConfig` profile override yourself
+  gives a `SubriteUser`, whose name, email and image may be `undefined`, not a `User`.
 - New exports can clash with your own names in `export *` re-exports.
 - `SubriteProfile` is marked `@deprecated`, so `@typescript-eslint/no-deprecated` reports the
   0.2.x augmentation.
@@ -99,11 +102,12 @@ Refreshing:
 - Public clients: with `token_endpoint_auth_method: 'none'`, or an empty client secret, the
   refresh sends only the client id.
 - `SubriteClaims`, `SubriteSession`, `SubriteTokens`, `SubriteTokenError`, `SubriteProvider`,
-  `SubriteUser`, `SubriteAuthMethod`, `RefreshParams` and `SignOutOptions` types. `RefreshParams.subriteUrl` and `generatePostSignOutUrl` accept a `URL`
-  as well as a string.
+  `SubriteProviderLike`, `SubriteUser`, `SubriteAuthMethod`, `RefreshParams` and
+  `SignOutOptions` types. `RefreshParams.subriteUrl` accepts a `URL` as well as a string.
 - A warning when `subriteUrl` has a path, which is ignored as before, and an error when the
   config sets a `token_endpoint_auth_method` the refresh can't use (or that is no method at all).
-  Each is logged once per process.
+  Each is logged once per process. An empty `token_endpoint_auth_method` counts as not set, as on
+  sign in.
 
 ### Fixed
 
@@ -123,8 +127,11 @@ Refreshing:
   growing to at most a minute unless `Retry-After` asks for longer, and one request at a time
   checks whether Subrite is back. The pause does not grow for `500 server_error`, which can be
   one account's bad data, so each broken account adds 10 seconds plus how long its check waits on
-  Subrite. When a check finds Subrite back, everyone refreshes right away. Signing out twice while
-  a check runs, or a clock that steps back, doesn't hold refreshes up.
+  Subrite. During an outage the client's pause replaces each refresh token's own wait, so a check
+  comes at least once a minute even when only users whose tokens already failed are around. When
+  a check finds Subrite back, everyone refreshes right away. Signing out twice while a check runs
+  doesn't hold refreshes up, and a clock that steps back never makes a token wait longer than it
+  was told to.
 - Requests that hold the same refresh token share one refresh within a server process, also
   across the copies of the library that Next.js loads for different routers. When Subrite
   replaced the refresh token, a later request with an old cookie gets the new tokens from memory

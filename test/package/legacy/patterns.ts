@@ -2,6 +2,7 @@
 // module resolutions. Found by testing upgrades from 0.2.1. It must keep compiling.
 import { Agent } from 'node:https';
 import type { NextAuthOptions, TokenSet } from 'next-auth';
+import type { OAuthConfig } from 'next-auth/providers/oauth';
 import Subrite, {
   generatePostSignOutUrl,
   refreshAccessToken,
@@ -56,6 +57,18 @@ export const double: ReturnType<typeof Subrite> = {
   type: 'oauth',
   profile: () => Promise.reject(new Error('not called in this test')),
 };
+// A double typed with NextAuth's own provider type, as apps write it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const nextAuthDouble: OAuthConfig<any>;
+export const fromNextAuthType: ReturnType<typeof Subrite> = nextAuthDouble;
+
+// Casts to a mock type, as with vitest's MockedFunction or jest.MockedFn. Their call signature
+// returns ReturnType<typeof Subrite>.
+type MockLike<T extends (...args: never[]) => unknown> = {
+  (...args: Parameters<T>): ReturnType<T>;
+  mock: { calls: Array<Parameters<T>> };
+};
+export const mockedSubrite = Subrite as MockLike<typeof Subrite>;
 
 export const options: NextAuthOptions = {
   providers: [withRoles, Subrite(proxyConfig), Subrite(signedConfig), styled],

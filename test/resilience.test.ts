@@ -736,12 +736,84 @@ describe('outages', () => {
     const token = sessionToken();
     await refreshAccessToken(token, subrite.params); // waits 10 s
     isDown = false;
+    // NTP sets the clock back 10 minutes. The token waits its 10 s, not 10 minutes more.
     mock.timers.setTime(start - 10 * MINUTE);
+    await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 1, 'still waiting');
+    mock.timers.tick(10_000);
     assert.match((await refreshAccessToken(token, subrite.params)).accessToken, /^access-/);
   });
 
-  for (const answer of ['back', 'still down'] as const) {
-    it(`keeps checking when a refresh token is revoked twice while it checks (Subrite ${answer})`, async () => {
+  it('a small step back does not cut a Retry-After short', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start });
+    const subrite = fakeSubrite({
+      token: () => new Response(null, { status: 429, headers: { 'Retry-After': '300' } }),
+    });
+    const token = sessionToken();
+    await refreshAccessToken(token, subrite.params);
+    mock.timers.setTime(start + 1000);
+    mock.timers.setTime(start - 1000);
+    await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 1);
+  });
+
+  it('checks at least once a minute while only users who already failed are around', async () => {
+    const tick = fakeClock();
+    const checkedAt: number[] = [];
+    const subrite = fakeSubrite({
+      token: () => {
+        checkedAt.push(Date.now());
+        return down();
+      },
+    });
+    const users = await startOutage(subrite.params);
+    // The same three users ask every 5 s for 15 minutes. Their own waits would grow to 5 minutes.
+    for (let second = 0; second < 900; second += 5) {
+      for (const user of users) await refreshAccessToken(user, subrite.params);
+      tick(5000);
+    }
+    const gaps = checkedAt.slice(1).map((at, i) => at - checkedAt[i]);
+    assert.ok(Math.max(...gaps) <= MINUTE, `longest time without a check: ${Math.max(...gaps)} ms`);
+    // Still one check at a time, and no more than one every 10 s.
+    assert.ok(checkedAt.length <= 3 + 900 / 10, `sent ${checkedAt.length}`);
+  });
+
+  it('a broken account that checks after a long outage adds only 10 s', async () => {
+    const tick = fakeClock();
+    let isDown = true;
+    const broken = sessionToken();
+    const subrite = fakeSubrite({
+      token: ({ form }) =>
+        form.get('refresh_token') === broken.refreshToken
+          ? serverError()
+          : isDown
+            ? down()
+            : rotatingTokens(),
+    });
+    await startOutage(subrite.params);
+    // The pause grows to a minute.
+    for (const pause of [10, 20, 40, 60]) {
+      tick(pause * 1000);
+      await refreshAccessToken(sessionToken(), subrite.params);
+    }
+    isDown = false;
+    tick(60_000);
+    await refreshAccessToken(broken, subrite.params); // the broken account checks first
+    tick(10_000);
+    assert.match(
+      (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
+      /^access-/,
+    );
+  });
+
+  for (const [revocations, answer] of [
+    [1, 'back'],
+    [2, 'back'],
+    [1, 'still down'],
+    [2, 'still down'],
+  ] as const) {
+    it(`keeps checking when a refresh token is revoked ${revocations === 1 ? 'once' : 'twice'} while it checks (Subrite ${answer})`, async () => {
       const tick = fakeClock();
       let isDown = true;
       let release: () => void = () => {};
@@ -757,9 +829,10 @@ describe('outages', () => {
       gate = new Promise<void>((resolve) => (release = resolve));
       const checking = sessionToken();
       const check = refreshAccessToken(checking, subrite.params);
-      // The user signs out twice (a double click, or two tabs) while the check waits on Subrite.
-      await revokeRefreshToken(checking, subrite.params);
-      await revokeRefreshToken(checking, subrite.params);
+      // The user signs out (twice: a double click, or two tabs) while the check waits on Subrite.
+      for (let i = 0; i < revocations; i += 1) {
+        await revokeRefreshToken(checking, subrite.params);
+      }
       isDown = answer === 'still down';
       release();
       await check;
@@ -771,6 +844,10 @@ describe('outages', () => {
       );
       const signedOut = await refreshAccessToken(checking, subrite.params);
       assert.equal(signedOut.error, 'RefreshAccessTokenError', 'the revocation still holds');
+      const sent = subrite.calls.token.filter(
+        (request) => request.form.get('refresh_token') === checking.refreshToken,
+      );
+      assert.equal(sent.length, 1, 'the revoked refresh token is not sent again');
     });
   }
 

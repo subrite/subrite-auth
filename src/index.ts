@@ -81,7 +81,10 @@ export type SubriteAuthMethod = 'client_secret_basic' | 'client_secret_post' | '
  * also be `undefined`, as 0.2.x returned them for missing claims. That also compiles with
  * `exactOptionalPropertyTypes`.
  */
-export type SubriteUser = Omit<User, 'name' | 'email' | 'image'> & {
+export type SubriteUser = {
+  // Not Omit, which would drop `id` when an app's User augmentation has an index signature.
+  [K in keyof User as K extends 'name' | 'email' | 'image' ? never : K]: User[K];
+} & {
   name?: string | null | undefined;
   email?: string | null | undefined;
   image?: string | null | undefined;
@@ -111,6 +114,14 @@ export type SubriteConfig = Omit<UserConfig, 'client' | 'profile' | 'style'> & {
 
 /** What Subrite() returns: a NextAuth provider whose `options` is the config passed in. */
 export type SubriteProvider = OAuthConfig<SubriteClaims> & { options: SubriteConfig };
+
+/**
+ * What `ReturnType<typeof Subrite>`, `jest.mocked(Subrite)` and `vi.mocked(Subrite)` see: the
+ * provider with `options` optional, so test doubles can leave it out.
+ */
+export type SubriteProviderLike = OAuthConfig<SubriteClaims> & {
+  options?: Partial<SubriteConfig> | undefined;
+};
 
 export type RefreshParams = {
   subriteUrl: string | URL;
@@ -207,14 +218,16 @@ const MAX_REFRESH_ENTRIES = 10_000;
 const PRUNE_INTERVAL_MS = 10_000;
 const DISCOVERY_CACHE_MS = 60 * 60 * 1000;
 
-// Calls get the first signature, with a typed `options`. ReturnType, jest.mocked and vi.mocked
-// read the last one, so test doubles written for 0.2.x without `options` still compile.
+// Direct calls get the first signature, with a typed `options`. ReturnType, mock types and
+// Subrite passed as a value (configs.map(Subrite)) get the last one, so test doubles written for
+// 0.2.x without `options` still compile.
 export default function Subrite(config: SubriteConfig): SubriteProvider;
-export default function Subrite(config: SubriteConfig): OAuthConfig<SubriteClaims>;
+export default function Subrite(config: SubriteConfig): SubriteProviderLike;
 export default function Subrite(config: SubriteConfig): SubriteProvider {
   warnAboutPath(config.subriteUrl);
+  // Empty counts as not set, as in openid-client, which NextAuth uses for the sign in.
   const authMethod = config.client?.token_endpoint_auth_method;
-  if (authMethod !== undefined && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
+  if (authMethod && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
     logOnce(
       `auth-method:${authMethod}`,
       SIGN_IN_ONLY_AUTH_METHODS.includes(authMethod)
@@ -363,7 +376,10 @@ type ClientHealth = {
    * failed. Otherwise a few broken accounts could keep healthy users out for minutes.
    */
   stalePausedUntil: number;
-  /** A refresh is checking whether Subrite is back. Others wait for it. */
+  /**
+   * A refresh is checking whether Subrite is back. Until it has an answer, other refresh tokens
+   * get their token back unchanged right away.
+   */
   probing: boolean;
 };
 
@@ -371,7 +387,10 @@ type State = {
   refreshes: Map<string, RefreshEntry>;
   clients: Map<string, ClientHealth>;
   lastPrune: number;
-  /** Counts resetRefreshState calls, so refreshes still in progress then are ignored. */
+  /**
+   * Counts resetRefreshState calls, so the outcome of refreshes still in progress then is
+   * ignored.
+   */
   generation: number;
 };
 
@@ -520,13 +539,25 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
   const key = refreshKeyOf(params, refreshToken);
   const health = clientHealth(clientKey, now);
   const existing = state.refreshes.get(key);
+  if (existing?.settled?.kind === 'temporary-failure' && (existing.settledAt ?? 0) > now) {
+    // The clock went backwards (for example an NTP correction), which would stretch the wait
+    // after this failure by the size of the step. Move the failure to now instead, so the token
+    // waits at most as long as it was told to, Retry-After included.
+    const shift = (existing.settledAt ?? 0) - now;
+    existing.settledAt = now;
+    existing.reuseUntil -= shift;
+    existing.keepUntil -= shift;
+  }
   // A failure during an outage is not the token's fault. Once Subrite answers again, try now.
   const forgiven = existing !== undefined && isForgiven(existing, health);
-  // A clock that went backwards (for example an NTP correction) would stretch the wait after a
-  // failure by the size of the step. Try now instead: the backoff and outage checks still apply.
-  const clockWentBack =
-    existing?.settled?.kind === 'temporary-failure' && (existing.settledAt ?? 0) > now;
-  if (existing && existing.reuseUntil > now && !forgiven && !clockWentBack) {
+  // During an outage, the pause for the whole client (at most a minute, unless Retry-After asks
+  // for longer) replaces the wait of a refresh token that failed in it. Otherwise, with only such
+  // tokens around, nothing would check whether Subrite is back for up to 5 minutes.
+  const outageWait =
+    health.outage &&
+    existing?.duringOutage === true &&
+    existing.settled?.kind === 'temporary-failure';
+  if (existing && existing.reuseUntil > now && !forgiven && !outageWait) {
     warnOnLateReuse(existing, now);
     return existing.outcome;
   }
@@ -550,7 +581,8 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
       // Subrite seems down. Keep the token and don't add to the load.
       return Promise.resolve(TEMPORARY);
     }
-    // This request checks whether Subrite is back. Other requests wait for its answer.
+    // This request checks whether Subrite is back. Until it has an answer, other refresh tokens
+    // get their token back unchanged.
     probe = true;
     health.probing = true;
     freshProbe = !stale;
@@ -605,6 +637,10 @@ function clientHealth(clientKey: string, now: number): ClientHealth {
   if (now < health.pausedFrom) {
     health.pausedUntil = now;
     health.stalePausedUntil = now;
+  }
+  // Keeps isForgiven from taking a failure moved back by the clock for one after the answer.
+  if (now < health.lastAnswer) {
+    health.lastAnswer = now;
   }
   // Failures far apart don't add up to an outage.
   if (health.failing.size > 0 && Math.abs(now - health.failingSince) > FAILURE_MEMORY_MS) {
@@ -690,11 +726,13 @@ function settle(
   }
 
   entry.duringOutage = true;
-  if (entry.probe && entry.freshProbe) {
-    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer,
-    // unless it was server_error, which may be that account's own problem. Then check again
-    // after a pause of the same length.
-    if (!outcome.serverError) health.step += 1;
+  if (entry.probe && entry.freshProbe && outcome.serverError) {
+    // server_error may be that account's own problem. Check again after the shortest pause,
+    // without making later pauses longer.
+    pause(health, now, outagePauseLength(1, outcome.retryAfterMs));
+  } else if (entry.probe && entry.freshProbe) {
+    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer.
+    health.step += 1;
     pause(health, now, outagePauseLength(health.step, outcome.retryAfterMs));
   } else if (entry.probe) {
     // No news from a refresh token that already failed. Only tokens like it wait again, so
@@ -1017,8 +1055,9 @@ function authenticatedForm(
   discovery: Discovery,
   params: RefreshParams,
 ): AuthenticatedForm | undefined {
+  // An empty method counts as not set, as in openid-client.
   const method =
-    params.client?.token_endpoint_auth_method ??
+    params.client?.token_endpoint_auth_method ||
     (params.clientSecret ? defaultAuthMethod(discovery) : 'none');
   const headers: Record<string, string> = {
     'Content-Type': 'application/x-www-form-urlencoded',

@@ -120,6 +120,16 @@ describe('Subrite provider', () => {
     });
     assert.match(loggedText(), /client_secret_postt is not a known method, so sign in and/);
   });
+
+  it('treats an empty token_endpoint_auth_method as not set, like the sign in', async () => {
+    const config = { client: { token_endpoint_auth_method: '' } };
+    const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
+    Subrite({ ...subrite.params, subriteUrl: subrite.subriteUrl, ...config });
+    assert.equal(loggedText(), '');
+    const refreshed = await refreshAccessToken(sessionToken(), { ...subrite.params, ...config });
+    assert.equal(refreshed.accessToken, 'a');
+    assert.match(subrite.calls.token[0].headers.get('authorization') ?? '', /^Basic /);
+  });
 });
 
 describe('toSubriteJWT', () => {
