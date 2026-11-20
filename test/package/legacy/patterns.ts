@@ -1,0 +1,100 @@
+// More 0.2.x code that compiled because the 0.2.1 types were `any` under the bundler and node16
+// module resolutions. Found by testing upgrades from 0.2.1. It must keep compiling.
+import { Agent } from 'node:https';
+import type { NextAuthOptions, TokenSet } from 'next-auth';
+import type { OAuthConfig } from 'next-auth/providers/oauth';
+import Subrite, {
+  generatePostSignOutUrl,
+  refreshAccessToken,
+  toSubriteJWT,
+  type SubriteProfile,
+} from '@subrite/next-auth-provider';
+
+// A client registered with client_secret_post, in a plain object shared with the refresh.
+const postConfig = {
+  clientId: 'your-client-id',
+  clientSecret: 'your-client-secret',
+  subriteUrl: 'https://example.subrite.no',
+  client: { token_endpoint_auth_method: 'client_secret_post' },
+};
+
+// Options NextAuth knows, in the object that also goes to refreshAccessToken.
+const proxyConfig = {
+  clientId: 'your-client-id',
+  clientSecret: 'your-client-secret',
+  subriteUrl: 'https://example.subrite.no',
+  httpOptions: { agent: new Agent() },
+};
+const signedConfig = {
+  clientId: 'your-client-id',
+  clientSecret: 'your-client-secret',
+  subriteUrl: 'https://example.subrite.no',
+  client: { id_token_signed_response_alg: 'RS256' },
+};
+
+const withRoles = Subrite({
+  ...postConfig,
+  // A profile override typed with the 0.2.x type.
+  profile(profile: SubriteProfile, tokens: TokenSet) {
+    return {
+      id: profile.sub,
+      name: profile.name,
+      email: profile.email,
+      image: profile.image,
+      ...toSubriteJWT(tokens),
+    };
+  },
+});
+
+// A button style with only some of the values NextAuth's sign in page reads.
+const styled = Subrite({ ...signedConfig, style: { logo: '/subrite.svg', bg: '#fff' } });
+
+// A test double for the provider, without `options`, as jest.mocked(Subrite).mockReturnValue
+// takes it.
+export const double: ReturnType<typeof Subrite> = {
+  id: 'subrite',
+  name: 'Subrite',
+  type: 'oauth',
+  profile: () => Promise.reject(new Error('not called in this test')),
+};
+// A double typed with NextAuth's own provider type, as apps write it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const nextAuthDouble: OAuthConfig<any>;
+export const fromNextAuthType: ReturnType<typeof Subrite> = nextAuthDouble;
+
+// Casts to a mock type, as with vitest's MockedFunction or jest.MockedFn. Their call signature
+// returns ReturnType<typeof Subrite>.
+type MockLike<T extends (...args: never[]) => unknown> = {
+  (...args: Parameters<T>): ReturnType<T>;
+  mock: { calls: Array<Parameters<T>> };
+};
+export const mockedSubrite = Subrite as MockLike<typeof Subrite>;
+
+export const options: NextAuthOptions = {
+  providers: [withRoles, Subrite(proxyConfig), Subrite(signedConfig), styled],
+  callbacks: {
+    async jwt({ token, account }) {
+      if (account) {
+        // Clearing the error with null.
+        return { ...token, ...toSubriteJWT(account), error: null };
+      }
+      if (Date.now() < token.accessTokenExpires) {
+        return token;
+      }
+      const refreshed = await refreshAccessToken(token, postConfig);
+      await refreshAccessToken(token, signedConfig);
+      await refreshAccessToken(token, proxyConfig);
+      if (!refreshed.error) {
+        refreshed.error = null;
+      }
+      return refreshed;
+    },
+  },
+};
+
+// The sign out URL built from the provider's own options.
+export const signOutUrl = generatePostSignOutUrl(
+  withRoles.options.subriteUrl,
+  withRoles.options.clientId,
+  'https://app.example.com/logout',
+);
