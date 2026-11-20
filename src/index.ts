@@ -225,7 +225,7 @@ export default function Subrite(config: SubriteConfig): SubriteProvider;
 export default function Subrite(config: SubriteConfig): SubriteProviderLike;
 export default function Subrite(config: SubriteConfig): SubriteProvider {
   warnAboutPath(config.subriteUrl);
-  // Empty counts as not set, as in openid-client, which NextAuth uses for the sign in.
+  // An empty method counts as not set.
   const authMethod = config.client?.token_endpoint_auth_method;
   if (authMethod && !SUPPORTED_AUTH_METHODS.includes(authMethod)) {
     logOnce(
@@ -333,6 +333,10 @@ type RefreshEntry = {
   /** Set once the request has finished. */
   settled?: RefreshOutcome;
   settledAt?: number;
+  /** monotonicNow() when it settled, to measure waits across a clock that went backwards. */
+  settledMono?: number;
+  /** state.seq when it settled, to order it against Subrite's answers whatever the clock does. */
+  settledSeq?: number;
   startedAt: number;
   /** The refresh token this entry sent to Subrite. */
   sentRefreshToken: string;
@@ -356,8 +360,8 @@ type RefreshEntry = {
 
 /** How Subrite has been answering for one Subrite URL and client id. */
 type ClientHealth = {
-  /** When Subrite last really answered a refresh (new tokens or a rejection). */
-  lastAnswer: number;
+  /** state.seq when Subrite last really answered a refresh (new tokens or a rejection). */
+  lastAnswerSeq: number;
   /**
    * Refresh tokens that failed since then, while no outage was declared. One failing refresh
    * token may be that token's own problem. Two different ones mean Subrite is likely down.
@@ -392,6 +396,8 @@ type State = {
    * ignored.
    */
   generation: number;
+  /** Counts settled refreshes and answers, to order them without the wall clock. */
+  seq: number;
 };
 
 // Next.js can load several copies of this module into one process, for example one for the
@@ -411,6 +417,7 @@ const state = /* @__PURE__ */ processWide<State>('state', () => ({
   clients: new Map(),
   lastPrune: 0,
   generation: 0,
+  seq: 0,
 }));
 
 /**
@@ -539,12 +546,15 @@ function sharedRefresh(refreshToken: string, params: RefreshParams): Promise<Ref
   const key = refreshKeyOf(params, refreshToken);
   const health = clientHealth(clientKey, now);
   const existing = state.refreshes.get(key);
-  if (existing?.settled?.kind === 'temporary-failure' && (existing.settledAt ?? 0) > now) {
+  const failedAt = existing?.settled?.kind === 'temporary-failure' ? existing.settledAt : undefined;
+  if (existing && failedAt !== undefined && failedAt > now) {
     // The clock went backwards (for example an NTP correction), which would stretch the wait
-    // after this failure by the size of the step. Move the failure to now instead, so the token
-    // waits at most as long as it was told to, Retry-After included.
-    const shift = (existing.settledAt ?? 0) - now;
-    existing.settledAt = now;
+    // after this failure by the size of the step. Take the time since the failure from the
+    // monotonic clock instead, so the token waits as long as it was told to, Retry-After
+    // included.
+    const elapsed = Math.max(0, monotonicNow() - (existing.settledMono ?? Infinity));
+    const shift = failedAt - (now - elapsed);
+    existing.settledAt = failedAt - shift;
     existing.reuseUntil -= shift;
     existing.keepUntil -= shift;
   }
@@ -612,7 +622,7 @@ function isForgiven(entry: RefreshEntry, health: ClientHealth): boolean {
   return (
     entry.settled?.kind === 'temporary-failure' &&
     entry.duringOutage &&
-    (entry.settledAt ?? 0) < health.lastAnswer
+    (entry.settledSeq ?? 0) < health.lastAnswerSeq
   );
 }
 
@@ -620,7 +630,7 @@ function clientHealth(clientKey: string, now: number): ClientHealth {
   let health = state.clients.get(clientKey);
   if (!health) {
     health = {
-      lastAnswer: 0,
+      lastAnswerSeq: 0,
       failing: new Set(),
       failingSince: 0,
       outage: false,
@@ -637,10 +647,6 @@ function clientHealth(clientKey: string, now: number): ClientHealth {
   if (now < health.pausedFrom) {
     health.pausedUntil = now;
     health.stalePausedUntil = now;
-  }
-  // Keeps isForgiven from taking a failure moved back by the clock for one after the answer.
-  if (now < health.lastAnswer) {
-    health.lastAnswer = now;
   }
   // Failures far apart don't add up to an outage.
   if (health.failing.size > 0 && Math.abs(now - health.failingSince) > FAILURE_MEMORY_MS) {
@@ -665,6 +671,8 @@ function settle(
   if (!revoked) {
     entry.settled = outcome;
     entry.settledAt = now;
+    entry.settledMono = monotonicNow();
+    entry.settledSeq = ++state.seq;
   }
   const health = clientHealth(clientKey, now);
   if (entry.probe) {
@@ -673,7 +681,7 @@ function settle(
 
   if (outcome.kind !== 'temporary-failure') {
     // Subrite answered, so it is up. Any outage is over.
-    health.lastAnswer = now;
+    health.lastAnswerSeq = ++state.seq;
     health.failing.clear();
     health.outage = false;
     health.step = 0;
@@ -726,19 +734,20 @@ function settle(
   }
 
   entry.duringOutage = true;
-  if (entry.probe && entry.freshProbe && outcome.serverError) {
-    // server_error may be that account's own problem. Check again after the shortest pause,
-    // without making later pauses longer.
-    pause(health, now, outagePauseLength(1, outcome.retryAfterMs));
-  } else if (entry.probe && entry.freshProbe) {
-    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer.
-    health.step += 1;
+  if (entry.probe && entry.freshProbe) {
+    // A refresh token that had not failed yet failed too: Subrite is still down. Wait longer,
+    // unless it was server_error, which may be that account's own problem. Then check again
+    // after a pause of the same length. (Not a shorter one: a struggling Subrite often mixes
+    // server_error with 503s and timeouts.)
+    if (!outcome.serverError) health.step += 1;
     pause(health, now, outagePauseLength(health.step, outcome.retryAfterMs));
   } else if (entry.probe) {
     // No news from a refresh token that already failed. Only tokens like it wait again, so
-    // users who haven't failed can still check whether Subrite is back.
+    // users who haven't failed can still check whether Subrite is back. The wait grows with the
+    // token's failures, so a few such users don't check every 10 seconds for a whole outage.
     health.pausedFrom = now;
-    health.stalePausedUntil = now + outagePauseLength(health.step, outcome.retryAfterMs);
+    health.stalePausedUntil =
+      now + outagePauseLength(Math.max(health.step, entry.failures), outcome.retryAfterMs);
   } else {
     // A request that was already on its way: part of the same step.
     const length = outagePauseLength(health.step, outcome.retryAfterMs);
@@ -1055,7 +1064,7 @@ function authenticatedForm(
   discovery: Discovery,
   params: RefreshParams,
 ): AuthenticatedForm | undefined {
-  // An empty method counts as not set, as in openid-client.
+  // An empty method counts as not set.
   const method =
     params.client?.token_endpoint_auth_method ||
     (params.clientSecret ? defaultAuthMethod(discovery) : 'none');
@@ -1230,6 +1239,11 @@ function warnAboutPath(subriteUrl: string | URL): void {
         `The path ${pathname} is ignored.`,
     );
   }
+}
+
+// Milliseconds that keep counting forward when the wall clock is set back.
+function monotonicNow(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now();
 }
 
 // AbortSignal.timeout, with a fallback for test environments without it, like jsdom before 22.1

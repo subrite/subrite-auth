@@ -779,32 +779,88 @@ describe('outages', () => {
     assert.ok(checkedAt.length <= 3 + 900 / 10, `sent ${checkedAt.length}`);
   });
 
-  it('a broken account that checks after a long outage adds only 10 s', async () => {
+  it('a server_error during a long outage keeps the pause at a minute', async () => {
     const tick = fakeClock();
-    let isDown = true;
-    const broken = sessionToken();
-    const subrite = fakeSubrite({
-      token: ({ form }) =>
-        form.get('refresh_token') === broken.refreshToken
-          ? serverError()
-          : isDown
-            ? down()
-            : rotatingTokens(),
-    });
+    let respond: () => Response = down;
+    const subrite = fakeSubrite({ token: () => respond() });
     await startOutage(subrite.params);
     // The pause grows to a minute.
     for (const pause of [10, 20, 40, 60]) {
       tick(pause * 1000);
       await refreshAccessToken(sessionToken(), subrite.params);
     }
-    isDown = false;
+    const sent = subrite.calls.token.length;
+    // A struggling Subrite answers one check with server_error.
+    respond = serverError;
     tick(60_000);
-    await refreshAccessToken(broken, subrite.params); // the broken account checks first
-    tick(10_000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    respond = down;
+    tick(59_000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, sent + 1, 'no check before the minute is over');
+    tick(1000);
+    await refreshAccessToken(sessionToken(), subrite.params);
+    assert.equal(subrite.calls.token.length, sent + 2);
+  });
+
+  it('a few users who already failed back off during a long outage', async () => {
+    const tick = fakeClock();
+    const subrite = fakeSubrite({ token: down });
+    const users = await startOutage(subrite.params);
+    // The same three users ask every 5 s for an hour.
+    for (let second = 0; second < 3600; second += 5) {
+      for (const user of users) await refreshAccessToken(user, subrite.params);
+      tick(5000);
+    }
+    // About one check a minute, not one every 10 s.
+    assert.ok(subrite.calls.token.length <= 3 + 75, `sent ${subrite.calls.token.length}`);
+  });
+
+  it('forgives a failure in the outage after Subrite answers, even if the clock went back', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start });
+    let isDown = true;
+    const subrite = fakeSubrite({
+      token: ({ form }) =>
+        isDown
+          ? new Response(null, {
+              status: 503,
+              headers:
+                form.get('refresh_token') === first.refreshToken ? { 'Retry-After': '300' } : {},
+            })
+          : rotatingTokens(),
+    });
+    const first = sessionToken();
+    await startOutage(subrite.params, [first, sessionToken(), sessionToken()]);
+    isDown = false;
+    mock.timers.tick(10_000);
+    // A user who hasn't failed finds Subrite back. Then NTP sets the clock back 10 minutes.
     assert.match(
       (await refreshAccessToken(sessionToken(), subrite.params)).accessToken,
       /^access-/,
     );
+    mock.timers.setTime(Date.now() - 10 * MINUTE);
+    assert.match((await refreshAccessToken(first, subrite.params)).accessToken, /^access-/);
+  });
+
+  it('after a clock step back, a token waits only what is left of its wait', async () => {
+    const start = Date.now();
+    mock.timers.enable({ apis: ['Date'], now: start });
+    let monotonic = 1_000_000;
+    mock.method(performance, 'now', () => monotonic);
+    let isDown = true;
+    const subrite = fakeSubrite({ token: () => (isDown ? down() : rotatingTokens()) });
+    const token = sessionToken();
+    await refreshAccessToken(token, subrite.params); // waits 10 s
+    isDown = false;
+    mock.timers.tick(8000);
+    monotonic += 8000;
+    mock.timers.setTime(Date.now() - 10 * MINUTE);
+    await refreshAccessToken(token, subrite.params);
+    assert.equal(subrite.calls.token.length, 1, 'still 2 s to wait');
+    mock.timers.tick(2000);
+    monotonic += 2000;
+    assert.match((await refreshAccessToken(token, subrite.params)).accessToken, /^access-/);
   });
 
   for (const [revocations, answer] of [

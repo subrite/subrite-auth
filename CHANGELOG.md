@@ -66,9 +66,9 @@ Refreshing:
   seconds, growing to a minute (or as long as `Retry-After` says, up to 5 minutes). Three broken
   accounts failing in a quiet moment look the same, so they can hold other users up briefly.
 - The refresh reads Subrite's OpenID configuration first (once an hour per server process) and
-  authenticates like the sign in, with HTTP Basic unless Subrite only supports
-  `client_secret_post` or the config sets `token_endpoint_auth_method`. 0.2.x posted the client
-  secret in the form to `/api/oidc/token`.
+  authenticates with HTTP Basic, like the sign in, unless Subrite only supports
+  `client_secret_post` or the config sets `token_endpoint_auth_method`. Without a client secret it
+  sends only the client id. 0.2.x posted the client secret in the form to `/api/oidc/token`.
 - Refreshes are shared within a server process. A second refresh with the same refresh token
   within 30 seconds gets the same access token without asking Subrite.
 - A refresh gives up after 30 seconds (`timeoutMs`). 0.2.x waited as long as `fetch` did. When
@@ -106,8 +106,7 @@ Refreshing:
   `SignOutOptions` types. `RefreshParams.subriteUrl` accepts a `URL` as well as a string.
 - A warning when `subriteUrl` has a path, which is ignored as before, and an error when the
   config sets a `token_endpoint_auth_method` the refresh can't use (or that is no method at all).
-  Each is logged once per process. An empty `token_endpoint_auth_method` counts as not set, as on
-  sign in.
+  Each is logged once per process. An empty `token_endpoint_auth_method` counts as not set.
 
 ### Fixed
 
@@ -126,8 +125,8 @@ Refreshing:
   (no new tokens and no rejection), refreshes for that Subrite client pause for 10 seconds,
   growing to at most a minute unless `Retry-After` asks for longer, and one request at a time
   checks whether Subrite is back. The pause does not grow for `500 server_error`, which can be
-  one account's bad data, so each broken account adds 10 seconds plus how long its check waits on
-  Subrite. During an outage the client's pause replaces each refresh token's own wait, so a check
+  one account's bad data, so each broken account adds one pause (10 seconds in a quiet moment, up
+  to a minute right after a long outage) plus how long its check waits on Subrite. During an outage the client's pause replaces each refresh token's own wait, so a check
   comes at least once a minute even when only users whose tokens already failed are around. When
   a check finds Subrite back, everyone refreshes right away. Signing out twice while a check runs
   doesn't hold refreshes up, and a clock that steps back never makes a token wait longer than it

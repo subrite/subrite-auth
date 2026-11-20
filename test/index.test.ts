@@ -121,7 +121,7 @@ describe('Subrite provider', () => {
     assert.match(loggedText(), /client_secret_postt is not a known method, so sign in and/);
   });
 
-  it('treats an empty token_endpoint_auth_method as not set, like the sign in', async () => {
+  it('treats an empty token_endpoint_auth_method as not set', async () => {
     const config = { client: { token_endpoint_auth_method: '' } };
     const subrite = fakeSubrite({ token: () => ok({ access_token: 'a', expires_in: 60 }) });
     Subrite({ ...subrite.params, subriteUrl: subrite.subriteUrl, ...config });
