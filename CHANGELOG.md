@@ -25,8 +25,9 @@ Installing:
   `nodemailer` must move to nodemailer 7 (`^7.0.7`) in the same install, or npm fails with
   `ERESOLVE`. `next-auth` 4.24.15 changes two things itself: `NEXTAUTH_URL` now wins over the host
   from the request headers (used on Vercel and with `AUTH_TRUST_HOST`), so a deployment that
-  serves several domains, or Vercel previews, must leave it unset. And a sign in started before
-  the deploy fails once at the callback.
+  serves several domains, or Vercel previews, must leave it unset, and then use `getServerSession`
+  and the secure cookie options for `getToken` and `withAuth` on HTTPS. And a sign in started
+  before the deploy fails once at the callback.
 
 TypeScript:
 
@@ -42,7 +43,9 @@ TypeScript:
   `provider.profile()` pass only the claims. `Parameters<typeof refreshAccessToken>[1]` has a
   `subriteUrl` that may be a `URL`. `style` read back from a config typed `SubriteConfig` may be
   partial. With `exactOptionalPropertyTypes`, calling a `SubriteConfig` profile override yourself
-  gives a `SubriteUser`, whose name, email and image may be `undefined`, not a `User`.
+  gives a `SubriteUser`, whose name, email and image may be `undefined`, not a `User`. A test
+  double typed `OAuthConfig<SubriteProfile>`, or a mock that returns its config argument as
+  `options`, no longer fits a mocked `Subrite`: type the double as `ReturnType<typeof Subrite>`.
 - New exports can clash with your own names in `export *` re-exports.
 - `SubriteProfile` is marked `@deprecated`, so `@typescript-eslint/no-deprecated` reports the
   0.2.x augmentation.
@@ -66,7 +69,7 @@ Refreshing:
   seconds, growing to a minute (or as long as `Retry-After` says, up to 5 minutes). Three broken
   accounts failing in a quiet moment look the same, so they can hold other users up briefly.
 - The refresh reads Subrite's OpenID configuration first (once an hour per server process) and
-  authenticates with HTTP Basic, like the sign in, unless Subrite only supports
+  authenticates with HTTP Basic unless Subrite only supports
   `client_secret_post` or the config sets `token_endpoint_auth_method`. Without a client secret it
   sends only the client id. 0.2.x posted the client secret in the form to `/api/oidc/token`.
 - Refreshes are shared within a server process. A second refresh with the same refresh token

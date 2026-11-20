@@ -369,7 +369,10 @@ Most apps upgrade without code changes. Each item says who it affects.
 
    If your app depends on `nodemailer` (for example for NextAuth's Email provider), `next-auth` 4.24.12 and later need nodemailer 7, or npm fails with `ERESOLVE`. Add `nodemailer@^7.0.7` to the same command. Its only breaking change is in the SES transport.
 
-3. **`next-auth` 4.24.15 behaves differently** in two ways. `NEXTAUTH_URL` now wins over the host from the request headers, which `next-auth` used on Vercel and with `AUTH_TRUST_HOST`. Where one deployment serves several domains, and for Vercel preview deployments, leave `NEXTAUTH_URL` unset (on Vercel, set it for Production only), so `next-auth` keeps using the request's host. Outside Vercel, on HTTPS, `getToken` and `withAuth` then look for the wrong session cookie: pass `secureCookie: true` to `getToken`, and `cookies: { sessionToken: { name: '__Secure-next-auth.session-token' } }` to `withAuth`. Everywhere else, set `NEXTAUTH_URL` to the URL the environment is served on. And a sign in that was started before your deploy fails once at the callback, because the sign in cookies now belong to a provider. Signing in again works.
+3. **`next-auth` 4.24.15 behaves differently** in two ways.
+   - `NEXTAUTH_URL` now wins over the host from the request headers, which `next-auth` used on Vercel and with `AUTH_TRUST_HOST`. Where a deployment serves one URL, set `NEXTAUTH_URL` to it.
+   - Where one deployment serves several domains, and for Vercel preview deployments, leave `NEXTAUTH_URL` unset (on Vercel, set it for Production only), so `next-auth` keeps using the request's host. Outside Vercel, on HTTPS, some helpers then miss the session. Use `getServerSession` on the server, not `getSession`, which fetches `http://localhost:3000` without the secure cookie. Pass `secureCookie: true` to `getToken`, and `cookies: { sessionToken: { name: '__Secure-next-auth.session-token' } }` to `withAuth`. Only there: environments served over HTTP, like local development, keep the defaults.
+   - A sign in that was started before your deploy fails once at the callback, because the sign in cookies now belong to a provider. Signing in again works.
 
 ### Code
 
